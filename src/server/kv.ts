@@ -1,4 +1,3 @@
-import { kv } from '@vercel/kv'
 import crypto from 'crypto'
 
 const ENCRYPTION_KEY = process.env.TV_CREDENTIAL_ENCRYPTION_KEY || 'default-dev-key-change-in-prod!'
@@ -11,6 +10,80 @@ const TV_CREDENTIALS_TTL = 60 * 60 * 24 * 7
 
 // Job TTL: 1 hour (for pending publish jobs)
 const JOB_TTL = 60 * 60
+
+// ============ In-Memory Store (for local development) ============
+
+interface StoreEntry {
+  value: string
+  expiresAt?: number
+}
+
+const memoryStore = new Map<string, StoreEntry>()
+
+// Check if we have Vercel KV configured
+const hasVercelKV = !!(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN)
+
+// Lazy-load Vercel KV only if configured
+let vercelKV: typeof import('@vercel/kv').kv | null = null
+
+async function getKV() {
+  if (!hasVercelKV) return null
+  if (!vercelKV) {
+    const { kv } = await import('@vercel/kv')
+    vercelKV = kv
+  }
+  return vercelKV
+}
+
+// Unified KV interface that works with both Vercel KV and in-memory store
+const store = {
+  async get<T = string>(key: string): Promise<T | null> {
+    const kv = await getKV()
+    if (kv) {
+      return kv.get<T>(key)
+    }
+
+    // In-memory fallback
+    const entry = memoryStore.get(key)
+    if (!entry) return null
+    if (entry.expiresAt && Date.now() > entry.expiresAt) {
+      memoryStore.delete(key)
+      return null
+    }
+    return entry.value as T
+  },
+
+  async set(key: string, value: string, options?: { ex?: number }): Promise<void> {
+    const kv = await getKV()
+    if (kv) {
+      await kv.set(key, value, options)
+      return
+    }
+
+    // In-memory fallback
+    const entry: StoreEntry = { value }
+    if (options?.ex) {
+      entry.expiresAt = Date.now() + options.ex * 1000
+    }
+    memoryStore.set(key, entry)
+  },
+
+  async del(key: string): Promise<void> {
+    const kv = await getKV()
+    if (kv) {
+      await kv.del(key)
+      return
+    }
+
+    // In-memory fallback
+    memoryStore.delete(key)
+  },
+}
+
+// Log which store we're using
+if (!hasVercelKV) {
+  console.log('📦 Using in-memory store for KV (set KV_REST_API_URL and KV_REST_API_TOKEN for Vercel KV)')
+}
 
 export interface UserSession {
   userId: string
@@ -93,12 +166,12 @@ export async function createUserSession(userId: string): Promise<UserSession> {
     createdAt: Date.now(),
   }
 
-  await kv.set(`session:${userId}`, JSON.stringify(session), { ex: SESSION_TTL })
+  await store.set(`session:${userId}`, JSON.stringify(session), { ex: SESSION_TTL })
   return session
 }
 
 export async function getUserSession(userId: string): Promise<UserSession | null> {
-  const data = await kv.get<string>(`session:${userId}`)
+  const data = await store.get<string>(`session:${userId}`)
   if (!data) return null
   return JSON.parse(data)
 }
@@ -111,7 +184,7 @@ export async function updateUserSession(
   if (!session) throw new Error('Session not found')
 
   const updated = { ...session, ...updates }
-  await kv.set(`session:${userId}`, JSON.stringify(updated), { ex: SESSION_TTL })
+  await store.set(`session:${userId}`, JSON.stringify(updated), { ex: SESSION_TTL })
 }
 
 // ============ TV Credentials ============
@@ -121,14 +194,14 @@ export async function storeTVCredentials(
   credentials: TVCredentialsData
 ): Promise<void> {
   const encrypted = encrypt(JSON.stringify(credentials))
-  await kv.set(`tv:${userId}`, encrypted, { ex: TV_CREDENTIALS_TTL })
+  await store.set(`tv:${userId}`, encrypted, { ex: TV_CREDENTIALS_TTL })
 
   // Update session to mark TV as connected
   await updateUserSession(userId, { tvConnected: true })
 }
 
 export async function getTVCredentials(userId: string): Promise<TVCredentialsData | null> {
-  const encrypted = await kv.get<string>(`tv:${userId}`)
+  const encrypted = await store.get<string>(`tv:${userId}`)
   if (!encrypted) return null
 
   try {
@@ -140,7 +213,7 @@ export async function getTVCredentials(userId: string): Promise<TVCredentialsDat
 }
 
 export async function deleteTVCredentials(userId: string): Promise<void> {
-  await kv.del(`tv:${userId}`)
+  await store.del(`tv:${userId}`)
   await updateUserSession(userId, { tvConnected: false })
 }
 
@@ -157,22 +230,22 @@ export async function createPublishJob(
     updatedAt: Date.now(),
   }
 
-  await kv.set(`job:${job.jobId}`, JSON.stringify(job), { ex: JOB_TTL })
+  await store.set(`job:${job.jobId}`, JSON.stringify(job), { ex: JOB_TTL })
 
   // Also index by stripe session for webhook lookup
-  await kv.set(`stripe-job:${params.stripeSessionId}`, job.jobId, { ex: JOB_TTL })
+  await store.set(`stripe-job:${params.stripeSessionId}`, job.jobId, { ex: JOB_TTL })
 
   return job
 }
 
 export async function getPublishJob(jobId: string): Promise<PublishJob | null> {
-  const data = await kv.get<string>(`job:${jobId}`)
+  const data = await store.get<string>(`job:${jobId}`)
   if (!data) return null
   return JSON.parse(data)
 }
 
 export async function getJobByStripeSession(stripeSessionId: string): Promise<PublishJob | null> {
-  const jobId = await kv.get<string>(`stripe-job:${stripeSessionId}`)
+  const jobId = await store.get<string>(`stripe-job:${stripeSessionId}`)
   if (!jobId) return null
   return getPublishJob(jobId)
 }
@@ -190,6 +263,6 @@ export async function updatePublishJob(
     updatedAt: Date.now(),
   }
 
-  await kv.set(`job:${jobId}`, JSON.stringify(updated), { ex: JOB_TTL })
+  await store.set(`job:${jobId}`, JSON.stringify(updated), { ex: JOB_TTL })
   return updated
 }

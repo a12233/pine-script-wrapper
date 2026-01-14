@@ -1,290 +1,149 @@
-Welcome to your new TanStack app! 
+# Pine Script Publisher
 
-# Getting Started
+A web app that wraps TradingView's Pine Script editor functionality. Validate, correct, and publish Pine Scripts as private TradingView indicators.
 
-To run this application:
+## Features
+
+- **Script Validation**: Paste Pine Script and validate against TradingView's compiler
+- **AI Corrections**: Get intelligent suggestions to fix script errors (powered by Claude)
+- **One-Click Publishing**: Publish validated scripts as private TradingView indicators
+- **Payment Integration**: Stripe checkout for one-time payments per script
+
+## Tech Stack
+
+- **Framework**: [TanStack Start](https://tanstack.com/start) (full-stack React with SSR)
+- **Browser Automation**: [Browserless.io](https://browserless.io) + Puppeteer
+- **Payments**: [Stripe](https://stripe.com) Checkout
+- **AI**: [Vercel AI SDK](https://ai-sdk.dev) with Anthropic Claude
+- **State/Sessions**: In-memory store (dev) / [Vercel KV](https://vercel.com/storage/kv) (prod)
+- **Hosting**: [Vercel](https://vercel.com)
+
+## Getting Started
+
+### Prerequisites
+
+- Node.js 20+
+- npm or bun
+
+### Installation
 
 ```bash
+# Clone the repo
+cd ~/pine-script-wrapper
+
+# Install dependencies
 npm install
+
+# Copy environment variables
+cp .env.example .env
+```
+
+### Development
+
+```bash
 npm run dev
 ```
 
-# Building For Production
+The app will be available at http://localhost:3000
 
-To build this application for production:
+### Environment Variables
+
+For local development, most features work without external services:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `BROWSERLESS_API_KEY` | For validation | Browserless.io API key |
+| `STRIPE_SECRET_KEY` | For payments | Stripe secret key |
+| `STRIPE_WEBHOOK_SECRET` | For payments | Stripe webhook signing secret |
+| `ANTHROPIC_API_KEY` | For AI corrections | Anthropic API key |
+| `KV_REST_API_URL` | Optional | Vercel KV URL (uses in-memory store if not set) |
+| `KV_REST_API_TOKEN` | Optional | Vercel KV token |
+
+## Project Structure
+
+```
+pine-script-wrapper/
+├── src/
+│   ├── routes/              # TanStack file-based routes
+│   │   ├── __root.tsx       # Root layout
+│   │   ├── index.tsx        # Home - script input
+│   │   ├── connect.tsx      # TradingView auth
+│   │   ├── validate.tsx     # Validation results
+│   │   └── success.tsx      # Post-payment confirmation
+│   ├── server/              # Server-side services
+│   │   ├── browserless.ts   # Browser automation client
+│   │   ├── tradingview.ts   # TradingView-specific automation
+│   │   ├── stripe.ts        # Stripe payment handling
+│   │   ├── ai.ts            # AI script analysis
+│   │   └── kv.ts            # Key-value storage
+│   ├── styles.css           # Global styles
+│   └── router.tsx           # Router configuration
+├── specs/                   # Ralph project specs
+├── .env.example             # Environment template
+└── package.json
+```
+
+## User Flow
+
+1. **Paste Script**: User pastes Pine Script on home page
+2. **Quick Check**: Optional local syntax validation
+3. **Connect TradingView**: User provides session cookies for their TV account
+4. **Validate**: Script is tested in TradingView's editor via browser automation
+5. **AI Corrections**: If errors found, AI suggests fixes
+6. **Payment**: Stripe checkout for publishing fee
+7. **Publish**: Script published as private indicator
+8. **Success**: User receives indicator URL
+
+## Scripts
+
+```bash
+npm run dev      # Start development server
+npm run build    # Build for production
+npm run preview  # Preview production build
+npm run test     # Run tests
+```
+
+## Deployment
+
+### Vercel (Recommended)
+
+1. Push to GitHub
+2. Import project in Vercel
+3. Add environment variables in Vercel dashboard
+4. Deploy
+
+### Manual
 
 ```bash
 npm run build
+# Deploy .output directory to your hosting provider
 ```
 
-## Testing
+## Configuration
 
-This project uses [Vitest](https://vitest.dev/) for testing. You can run the tests with:
+### Stripe Setup
 
-```bash
-npm run test
-```
+1. Create Stripe account at stripe.com
+2. Get API keys from Dashboard → Developers → API keys
+3. Set up webhook endpoint: `https://your-domain.com/api/stripe/webhook`
+4. Add keys to `.env`
 
-## Styling
+### Browserless Setup
 
-This project uses CSS for styling.
+1. Create account at browserless.io
+2. Get API key from dashboard
+3. Add to `.env` as `BROWSERLESS_API_KEY`
 
+### Vercel KV Setup (Production)
 
+1. In Vercel dashboard: Storage → Create Database → KV
+2. Link to your project
+3. Environment variables are automatically added
 
+## License
 
-## Routing
-This project uses [TanStack Router](https://tanstack.com/router). The initial setup is a file based router. Which means that the routes are managed as files in `src/routes`.
+Private - All rights reserved
 
-### Adding A Route
+## Support
 
-To add a new route to your application just add another a new file in the `./src/routes` directory.
-
-TanStack will automatically generate the content of the route file for you.
-
-Now that you have two routes you can use a `Link` component to navigate between them.
-
-### Adding Links
-
-To use SPA (Single Page Application) navigation you will need to import the `Link` component from `@tanstack/react-router`.
-
-```tsx
-import { Link } from "@tanstack/react-router";
-```
-
-Then anywhere in your JSX you can use it like so:
-
-```tsx
-<Link to="/about">About</Link>
-```
-
-This will create a link that will navigate to the `/about` route.
-
-More information on the `Link` component can be found in the [Link documentation](https://tanstack.com/router/v1/docs/framework/react/api/router/linkComponent).
-
-### Using A Layout
-
-In the File Based Routing setup the layout is located in `src/routes/__root.tsx`. Anything you add to the root route will appear in all the routes. The route content will appear in the JSX where you use the `<Outlet />` component.
-
-Here is an example layout that includes a header:
-
-```tsx
-import { Outlet, createRootRoute } from '@tanstack/react-router'
-import { TanStackRouterDevtools } from '@tanstack/react-router-devtools'
-
-import { Link } from "@tanstack/react-router";
-
-export const Route = createRootRoute({
-  component: () => (
-    <>
-      <header>
-        <nav>
-          <Link to="/">Home</Link>
-          <Link to="/about">About</Link>
-        </nav>
-      </header>
-      <Outlet />
-      <TanStackRouterDevtools />
-    </>
-  ),
-})
-```
-
-The `<TanStackRouterDevtools />` component is not required so you can remove it if you don't want it in your layout.
-
-More information on layouts can be found in the [Layouts documentation](https://tanstack.com/router/latest/docs/framework/react/guide/routing-concepts#layouts).
-
-
-## Data Fetching
-
-There are multiple ways to fetch data in your application. You can use TanStack Query to fetch data from a server. But you can also use the `loader` functionality built into TanStack Router to load the data for a route before it's rendered.
-
-For example:
-
-```tsx
-const peopleRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/people",
-  loader: async () => {
-    const response = await fetch("https://swapi.dev/api/people");
-    return response.json() as Promise<{
-      results: {
-        name: string;
-      }[];
-    }>;
-  },
-  component: () => {
-    const data = peopleRoute.useLoaderData();
-    return (
-      <ul>
-        {data.results.map((person) => (
-          <li key={person.name}>{person.name}</li>
-        ))}
-      </ul>
-    );
-  },
-});
-```
-
-Loaders simplify your data fetching logic dramatically. Check out more information in the [Loader documentation](https://tanstack.com/router/latest/docs/framework/react/guide/data-loading#loader-parameters).
-
-### React-Query
-
-React-Query is an excellent addition or alternative to route loading and integrating it into you application is a breeze.
-
-First add your dependencies:
-
-```bash
-npm install @tanstack/react-query @tanstack/react-query-devtools
-```
-
-Next we'll need to create a query client and provider. We recommend putting those in `main.tsx`.
-
-```tsx
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-
-// ...
-
-const queryClient = new QueryClient();
-
-// ...
-
-if (!rootElement.innerHTML) {
-  const root = ReactDOM.createRoot(rootElement);
-
-  root.render(
-    <QueryClientProvider client={queryClient}>
-      <RouterProvider router={router} />
-    </QueryClientProvider>
-  );
-}
-```
-
-You can also add TanStack Query Devtools to the root route (optional).
-
-```tsx
-import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
-
-const rootRoute = createRootRoute({
-  component: () => (
-    <>
-      <Outlet />
-      <ReactQueryDevtools buttonPosition="top-right" />
-      <TanStackRouterDevtools />
-    </>
-  ),
-});
-```
-
-Now you can use `useQuery` to fetch your data.
-
-```tsx
-import { useQuery } from "@tanstack/react-query";
-
-import "./App.css";
-
-function App() {
-  const { data } = useQuery({
-    queryKey: ["people"],
-    queryFn: () =>
-      fetch("https://swapi.dev/api/people")
-        .then((res) => res.json())
-        .then((data) => data.results as { name: string }[]),
-    initialData: [],
-  });
-
-  return (
-    <div>
-      <ul>
-        {data.map((person) => (
-          <li key={person.name}>{person.name}</li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-export default App;
-```
-
-You can find out everything you need to know on how to use React-Query in the [React-Query documentation](https://tanstack.com/query/latest/docs/framework/react/overview).
-
-## State Management
-
-Another common requirement for React applications is state management. There are many options for state management in React. TanStack Store provides a great starting point for your project.
-
-First you need to add TanStack Store as a dependency:
-
-```bash
-npm install @tanstack/store
-```
-
-Now let's create a simple counter in the `src/App.tsx` file as a demonstration.
-
-```tsx
-import { useStore } from "@tanstack/react-store";
-import { Store } from "@tanstack/store";
-import "./App.css";
-
-const countStore = new Store(0);
-
-function App() {
-  const count = useStore(countStore);
-  return (
-    <div>
-      <button onClick={() => countStore.setState((n) => n + 1)}>
-        Increment - {count}
-      </button>
-    </div>
-  );
-}
-
-export default App;
-```
-
-One of the many nice features of TanStack Store is the ability to derive state from other state. That derived state will update when the base state updates.
-
-Let's check this out by doubling the count using derived state.
-
-```tsx
-import { useStore } from "@tanstack/react-store";
-import { Store, Derived } from "@tanstack/store";
-import "./App.css";
-
-const countStore = new Store(0);
-
-const doubledStore = new Derived({
-  fn: () => countStore.state * 2,
-  deps: [countStore],
-});
-doubledStore.mount();
-
-function App() {
-  const count = useStore(countStore);
-  const doubledCount = useStore(doubledStore);
-
-  return (
-    <div>
-      <button onClick={() => countStore.setState((n) => n + 1)}>
-        Increment - {count}
-      </button>
-      <div>Doubled - {doubledCount}</div>
-    </div>
-  );
-}
-
-export default App;
-```
-
-We use the `Derived` class to create a new store that is derived from another store. The `Derived` class has a `mount` method that will start the derived store updating.
-
-Once we've created the derived store we can use it in the `App` component just like we would any other store using the `useStore` hook.
-
-You can find out everything you need to know on how to use TanStack Store in the [TanStack Store documentation](https://tanstack.com/store/latest).
-
-# Demo files
-
-Files prefixed with `demo` can be safely deleted. They are there to provide a starting point for you to play around with the features you've installed.
-
-# Learn More
-
-You can learn more about all of the offerings from TanStack in the [TanStack documentation](https://tanstack.com).
+For issues and feature requests, please open a GitHub issue.
