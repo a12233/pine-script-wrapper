@@ -4,10 +4,34 @@ A web app that wraps TradingView's Pine Script editor functionality. Validate, c
 
 ## Features
 
-- **Script Validation**: Paste Pine Script and validate against TradingView's compiler
-- **AI Corrections**: Get intelligent suggestions to fix script errors (powered by Claude)
+- **Quick Syntax Check**: Instant local validation without external services
+- **Script Validation**: Full validation against TradingView's compiler via browser automation
+- **AI Corrections**: Intelligent suggestions to fix script errors (powered by Claude via OpenRouter)
 - **One-Click Publishing**: Publish validated scripts as private TradingView indicators
 - **Payment Integration**: Stripe checkout for one-time payments per script
+
+## Quick Syntax Check
+
+The "Quick Syntax Check" button provides instant, offline validation of your Pine Script. It runs entirely in your browser without needing any API keys or external services.
+
+**What it checks:**
+
+| Check | Description |
+|-------|-------------|
+| Version declaration | Warns if `//@version=5` is missing |
+| Bracket matching | Counts `(` vs `)` and `[` vs `]` to catch unclosed brackets |
+| v4→v5 migration | Detects deprecated syntax like `study()` → `indicator()`, `security()` → `request.security()` |
+| Declaration check | Ensures `indicator()`, `strategy()`, or `library()` is present |
+
+**Example issues it catches:**
+
+```pine
+// Missing //@version=5
+indicator("Test")
+plot(close    // ← Unclosed parenthesis
+```
+
+This is different from the full **Validate & Publish** flow, which uses TradingView's actual compiler via Browserless.io and provides AI-powered correction suggestions via OpenRouter.
 
 ## Tech Stack
 
