@@ -14,7 +14,7 @@ A web app that wraps TradingView's Pine Script editor functionality. Validate, c
 - **Framework**: [TanStack Start](https://tanstack.com/start) (full-stack React with SSR)
 - **Browser Automation**: [Browserless.io](https://browserless.io) + Puppeteer
 - **Payments**: [Stripe](https://stripe.com) Checkout
-- **AI**: [Vercel AI SDK](https://ai-sdk.dev) with Anthropic Claude
+- **AI**: [Vercel AI SDK](https://ai-sdk.dev) with [OpenRouter](https://openrouter.ai) (access to Claude, GPT-4, etc.)
 - **State/Sessions**: In-memory store (dev) / [Vercel KV](https://vercel.com/storage/kv) (prod)
 - **Hosting**: [Vercel](https://vercel.com)
 
@@ -52,10 +52,11 @@ For local development, most features work without external services:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
+| `OPENROUTER_API_KEY` | For AI corrections | OpenRouter API key |
+| `OPENROUTER_MODEL` | Optional | Model to use (default: `anthropic/claude-sonnet-4`) |
 | `BROWSERLESS_API_KEY` | For validation | Browserless.io API key |
 | `STRIPE_SECRET_KEY` | For payments | Stripe secret key |
 | `STRIPE_WEBHOOK_SECRET` | For payments | Stripe webhook signing secret |
-| `ANTHROPIC_API_KEY` | For AI corrections | Anthropic API key |
 | `KV_REST_API_URL` | Optional | Vercel KV URL (uses in-memory store if not set) |
 | `KV_REST_API_TOKEN` | Optional | Vercel KV token |
 

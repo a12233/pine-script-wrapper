@@ -1,6 +1,16 @@
 import { generateText, generateObject } from 'ai'
-import { anthropic } from '@ai-sdk/anthropic'
+import { createOpenAI } from '@ai-sdk/openai'
 import { z } from 'zod'
+
+// OpenRouter client (OpenAI-compatible API)
+const openrouter = createOpenAI({
+  baseURL: 'https://openrouter.ai/api/v1',
+  apiKey: process.env.OPENROUTER_API_KEY,
+})
+
+// Default model - can be changed to any model on OpenRouter
+// See https://openrouter.ai/models for available models
+const DEFAULT_MODEL = process.env.OPENROUTER_MODEL || 'anthropic/claude-sonnet-4'
 
 // Pine Script analysis prompts
 const ANALYSIS_SYSTEM_PROMPT = `You are an expert Pine Script developer for TradingView.
@@ -46,7 +56,7 @@ export interface AnalysisResult {
  */
 export async function analyzePineScript(script: string): Promise<AnalysisResult> {
   const { text } = await generateText({
-    model: anthropic('claude-sonnet-4-20250514'),
+    model: openrouter(DEFAULT_MODEL),
     system: ANALYSIS_SYSTEM_PROMPT,
     prompt: `Analyze this Pine Script for potential issues. Be concise.
 
@@ -88,7 +98,7 @@ export async function generateCorrections(
   tvErrors: string
 ): Promise<CorrectionResult> {
   const { object } = await generateObject({
-    model: anthropic('claude-sonnet-4-20250514'),
+    model: openrouter(DEFAULT_MODEL),
     system: ANALYSIS_SYSTEM_PROMPT,
     schema: CorrectionSchema,
     prompt: `Fix this Pine Script based on the TradingView compiler errors.
