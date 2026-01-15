@@ -10,6 +10,10 @@ import {
 // Helper function for delays
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
+// Environment credentials for auto-login
+const TV_USERNAME = process.env.TV_USERNAME
+const TV_PASSWORD = process.env.TV_PASSWORD
+
 // TradingView DOM selectors - maintain separately for easy updates when TV changes UI
 const TV_SELECTORS = {
   // Pine Editor
@@ -33,6 +37,11 @@ const TV_SELECTORS = {
   auth: {
     userMenu: '[data-name="header-user-menu-button"]',
     loginButton: '[data-name="header-signin-button"]',
+    // Login form selectors
+    emailInput: 'input[name="id_username"]',
+    passwordInput: 'input[name="id_password"]',
+    submitButton: 'button[type="submit"]',
+    emailTab: '[data-name="email"]',
   },
   // Chart page
   chart: {
@@ -96,10 +105,105 @@ export function parseTVCookies(credentials: TVCredentials): Array<{
   ]
 }
 
+// Dev mode bypass - skip actual TradingView operations
+const DEV_BYPASS = process.env.NODE_ENV === 'development' && process.env.TV_DEV_BYPASS === 'true'
+
+/**
+ * Login to TradingView using username/password and extract session cookies
+ */
+export async function loginWithCredentials(): Promise<TVCredentials | null> {
+  if (!TV_USERNAME || !TV_PASSWORD) {
+    console.log('[TV] No username/password configured in environment')
+    return null
+  }
+
+  let session: BrowserlessSession | null = null
+
+  try {
+    console.log('[TV] Attempting auto-login with environment credentials')
+    session = await createBrowserSession()
+    const { page, browser } = session
+
+    // Navigate to TradingView login page
+    await navigateTo(page, 'https://www.tradingview.com/accounts/signin/')
+    await delay(2000)
+
+    // Click email tab if visible (TradingView sometimes shows social login first)
+    try {
+      const emailTab = await page.$(TV_SELECTORS.auth.emailTab)
+      if (emailTab) {
+        await emailTab.click()
+        await delay(500)
+      }
+    } catch {
+      // Email tab might not exist, continue
+    }
+
+    // Wait for and fill in email/username
+    await waitForElement(page, TV_SELECTORS.auth.emailInput, 10000)
+    await page.type(TV_SELECTORS.auth.emailInput, TV_USERNAME)
+    await delay(500)
+
+    // Fill in password
+    await page.type(TV_SELECTORS.auth.passwordInput, TV_PASSWORD)
+    await delay(500)
+
+    // Submit login form
+    await page.click(TV_SELECTORS.auth.submitButton)
+
+    // Wait for login to complete (redirect to chart or home)
+    await delay(5000)
+
+    // Check if login was successful
+    const isLoggedIn = await waitForElement(page, TV_SELECTORS.auth.userMenu, 10000)
+    if (!isLoggedIn) {
+      console.error('[TV] Login failed - user menu not found')
+      return null
+    }
+
+    // Extract cookies
+    const cookies = await page.cookies('https://www.tradingview.com')
+    const sessionIdCookie = cookies.find(c => c.name === 'sessionid')
+    const signatureCookie = cookies.find(c => c.name === 'sessionid_sign')
+
+    if (!sessionIdCookie || !signatureCookie) {
+      console.error('[TV] Login succeeded but could not extract session cookies')
+      return null
+    }
+
+    console.log('[TV] Auto-login successful, cookies extracted')
+    return {
+      sessionId: sessionIdCookie.value,
+      signature: signatureCookie.value,
+      userId: 'auto-login',
+    }
+  } catch (error) {
+    console.error('[TV] Auto-login failed:', error)
+    return null
+  } finally {
+    if (session) {
+      await closeBrowserSession(session)
+    }
+  }
+}
+
+/**
+ * Check if auto-login is available
+ */
+export function hasAutoLoginCredentials(): boolean {
+  return !!(TV_USERNAME && TV_PASSWORD)
+}
+
 /**
  * Verify TradingView session is valid
  */
 export async function verifyTVSession(credentials: TVCredentials): Promise<boolean> {
+  // Dev mode bypass
+  if (DEV_BYPASS) {
+    console.log('[TV] Dev bypass: Skipping session verification')
+    return true
+  }
+
   let session: BrowserlessSession | null = null
 
   try {
@@ -134,6 +238,16 @@ export async function validatePineScript(
   credentials: TVCredentials,
   script: string
 ): Promise<ValidationResult> {
+  // Dev mode bypass
+  if (DEV_BYPASS) {
+    console.log('[TV] Dev bypass: Skipping script validation')
+    return {
+      isValid: true,
+      errors: [],
+      rawOutput: '[Dev Mode] Validation bypassed',
+    }
+  }
+
   let session: BrowserlessSession | null = null
 
   try {
@@ -228,15 +342,31 @@ export async function validatePineScript(
   }
 }
 
+export interface PublishOptions {
+  script: string
+  title: string
+  description: string
+}
+
 /**
  * Publish a Pine Script as a private indicator
  */
 export async function publishPineScript(
   credentials: TVCredentials,
-  script: string,
-  title: string,
-  description: string
+  options: PublishOptions
 ): Promise<PublishResult> {
+  const { script, title, description } = options
+
+  // Dev mode bypass
+  if (DEV_BYPASS) {
+    console.log('[TV] Dev bypass: Simulating script publish')
+    const fakeId = Math.random().toString(36).substring(7)
+    return {
+      success: true,
+      indicatorUrl: `https://www.tradingview.com/script/${fakeId}/dev-test-indicator`,
+    }
+  }
+
   let session: BrowserlessSession | null = null
 
   try {

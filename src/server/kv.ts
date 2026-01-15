@@ -1,4 +1,5 @@
 import crypto from 'crypto'
+import Redis from 'ioredis'
 
 const ENCRYPTION_KEY = process.env.TV_CREDENTIAL_ENCRYPTION_KEY || 'default-dev-key-change-in-prod!'
 
@@ -20,27 +21,32 @@ interface StoreEntry {
 
 const memoryStore = new Map<string, StoreEntry>()
 
-// Check if we have Vercel KV configured
-const hasVercelKV = !!(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN)
+// Check if we have Redis configured
+const REDIS_URL = process.env.REDIS_URL
 
-// Lazy-load Vercel KV only if configured
-let vercelKV: typeof import('@vercel/kv').kv | null = null
+// Lazy-load Redis only if configured
+let redisClient: Redis | null = null
 
-async function getKV() {
-  if (!hasVercelKV) return null
-  if (!vercelKV) {
-    const { kv } = await import('@vercel/kv')
-    vercelKV = kv
+function getRedis(): Redis | null {
+  if (!REDIS_URL) return null
+  if (!redisClient) {
+    redisClient = new Redis(REDIS_URL, {
+      maxRetriesPerRequest: 3,
+      retryDelayOnFailover: 100,
+    })
+    redisClient.on('error', (err) => console.error('Redis error:', err))
   }
-  return vercelKV
+  return redisClient
 }
 
-// Unified KV interface that works with both Vercel KV and in-memory store
+// Unified KV interface that works with both Redis and in-memory store
 const store = {
   async get<T = string>(key: string): Promise<T | null> {
-    const kv = await getKV()
-    if (kv) {
-      return kv.get<T>(key)
+    const redis = getRedis()
+    if (redis) {
+      const value = await redis.get(key)
+      if (!value) return null
+      return value as T
     }
 
     // In-memory fallback
@@ -54,9 +60,13 @@ const store = {
   },
 
   async set(key: string, value: string, options?: { ex?: number }): Promise<void> {
-    const kv = await getKV()
-    if (kv) {
-      await kv.set(key, value, options)
+    const redis = getRedis()
+    if (redis) {
+      if (options?.ex) {
+        await redis.set(key, value, 'EX', options.ex)
+      } else {
+        await redis.set(key, value)
+      }
       return
     }
 
@@ -69,9 +79,9 @@ const store = {
   },
 
   async del(key: string): Promise<void> {
-    const kv = await getKV()
-    if (kv) {
-      await kv.del(key)
+    const redis = getRedis()
+    if (redis) {
+      await redis.del(key)
       return
     }
 
@@ -81,8 +91,10 @@ const store = {
 }
 
 // Log which store we're using
-if (!hasVercelKV) {
-  console.log('📦 Using in-memory store for KV (set KV_REST_API_URL and KV_REST_API_TOKEN for Vercel KV)')
+if (!REDIS_URL) {
+  console.log('📦 Using in-memory store (set REDIS_URL for Redis/Upstash)')
+} else {
+  console.log('📦 Using Redis for KV storage')
 }
 
 export interface UserSession {
