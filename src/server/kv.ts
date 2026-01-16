@@ -128,20 +128,42 @@ export interface PublishJob {
 
 /**
  * Simple encryption for storing sensitive data
+ * Uses random salt and IV for each encryption operation
  */
 function encrypt(text: string): string {
-  const key = crypto.scryptSync(ENCRYPTION_KEY, 'salt', 32)
+  const salt = crypto.randomBytes(32) // Generate random salt for each encryption
+  const key = crypto.scryptSync(ENCRYPTION_KEY, salt, 32)
   const iv = crypto.randomBytes(16)
   const cipher = crypto.createCipheriv('aes-256-cbc', key, iv)
   let encrypted = cipher.update(text, 'utf8', 'hex')
   encrypted += cipher.final('hex')
-  return iv.toString('hex') + ':' + encrypted
+  // Store salt:iv:encrypted to allow decryption
+  return salt.toString('hex') + ':' + iv.toString('hex') + ':' + encrypted
 }
 
 function decrypt(encryptedText: string): string {
-  const [ivHex, encrypted] = encryptedText.split(':')
-  const key = crypto.scryptSync(ENCRYPTION_KEY, 'salt', 32)
-  const iv = Buffer.from(ivHex, 'hex')
+  const parts = encryptedText.split(':')
+
+  // Handle both old format (iv:encrypted) and new format (salt:iv:encrypted)
+  let salt: Buffer
+  let iv: Buffer
+  let encrypted: string
+
+  if (parts.length === 3) {
+    // New format with salt
+    salt = Buffer.from(parts[0], 'hex')
+    iv = Buffer.from(parts[1], 'hex')
+    encrypted = parts[2]
+  } else if (parts.length === 2) {
+    // Old format without salt - use hardcoded salt for backward compatibility
+    salt = Buffer.from('salt', 'utf8')
+    iv = Buffer.from(parts[0], 'hex')
+    encrypted = parts[1]
+  } else {
+    throw new Error('Invalid encrypted text format')
+  }
+
+  const key = crypto.scryptSync(ENCRYPTION_KEY, salt, 32)
   const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv)
   let decrypted = decipher.update(encrypted, 'hex', 'utf8')
   decrypted += decipher.final('utf8')
