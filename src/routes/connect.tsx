@@ -1,10 +1,36 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useState } from 'react'
 import { createServerFn } from '@tanstack/react-start'
-import { verifyTVSession } from '../server/tradingview'
+import { verifyTVSession, loginWithCredentials, hasAutoLoginCredentials } from '../server/tradingview'
 import { storeTVCredentials, createUserSession, generateUserId } from '../server/kv'
 
-// Server function to verify and store TV credentials
+// Check if auto-login is available
+const checkAutoLogin = createServerFn().handler(async () => {
+  return { available: hasAutoLoginCredentials() }
+})
+
+// Server function for auto-login with environment credentials
+const autoLoginTradingView = createServerFn().handler(async () => {
+  const credentials = await loginWithCredentials()
+
+  if (!credentials) {
+    return { success: false, error: 'Auto-login failed. Check your TV_USERNAME and TV_PASSWORD in .env' }
+  }
+
+  // Create user session and store credentials
+  const userId = generateUserId()
+  await createUserSession(userId)
+  await storeTVCredentials(userId, {
+    sessionId: credentials.sessionId,
+    signature: credentials.signature,
+    userId,
+    expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000, // 7 days
+  })
+
+  return { success: true, userId }
+})
+
+// Server function to verify and store TV credentials (manual cookie entry)
 const connectTradingView = createServerFn()
   .handler(async (ctx: { data: { sessionId: string; signature: string } }) => {
     const { sessionId, signature } = ctx.data
@@ -35,14 +61,39 @@ const connectTradingView = createServerFn()
 
 export const Route = createFileRoute('/connect')({
   component: ConnectPage,
+  loader: () => checkAutoLogin(),
 })
 
 function ConnectPage() {
+  const { available: autoLoginAvailable } = Route.useLoaderData()
   const navigate = useNavigate()
   const [sessionId, setSessionId] = useState('')
   const [signature, setSignature] = useState('')
   const [isConnecting, setIsConnecting] = useState(false)
+  const [isAutoLogging, setIsAutoLogging] = useState(false)
   const [error, setError] = useState('')
+
+  const handleAutoLogin = async () => {
+    setIsAutoLogging(true)
+    setError('')
+
+    try {
+      const result = await autoLoginTradingView()
+
+      if (result.success) {
+        // Store userId in localStorage
+        localStorage.setItem('userId', result.userId)
+        navigate({ to: '/' })
+      } else {
+        setError(result.error || 'Auto-login failed')
+      }
+    } catch (err) {
+      setError('Auto-login failed. Please try manual cookie entry.')
+      console.error(err)
+    } finally {
+      setIsAutoLogging(false)
+    }
+  }
 
   const handleConnect = async () => {
     if (!sessionId.trim() || !signature.trim()) {
@@ -59,6 +110,8 @@ function ConnectPage() {
       })
 
       if (result.success) {
+        // Store userId in localStorage
+        localStorage.setItem('userId', result.userId)
         navigate({ to: '/' })
       } else {
         setError(result.error || 'Failed to connect')
@@ -78,9 +131,32 @@ function ConnectPage() {
         <p>Link your TradingView account to validate and publish scripts</p>
       </div>
 
+      {/* Auto-login option */}
+      {autoLoginAvailable && (
+        <div className="card">
+          <div className="card-header">
+            <h2>Quick Connect</h2>
+            <span className="badge badge-success">Recommended</span>
+          </div>
+
+          <p>Auto-login using configured credentials.</p>
+
+          {error && <div className="error-message">{error}</div>}
+
+          <button
+            className="btn btn-primary btn-large"
+            onClick={handleAutoLogin}
+            disabled={isAutoLogging}
+            style={{ width: '100%', marginTop: '1rem' }}
+          >
+            {isAutoLogging ? 'Connecting...' : 'Connect Automatically'}
+          </button>
+        </div>
+      )}
+
       <div className="card">
         <div className="card-header">
-          <h2>How to Get Your Cookies</h2>
+          <h2>{autoLoginAvailable ? 'Manual Connect (Alternative)' : 'How to Get Your Cookies'}</h2>
         </div>
 
         <div className="instructions">

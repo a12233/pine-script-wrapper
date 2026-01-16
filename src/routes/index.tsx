@@ -1,19 +1,21 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { createServerFn } from '@tanstack/react-start'
 import { quickSyntaxCheck } from '../server/ai'
 import { getUserSession } from '../server/kv'
 
 // Server function to check if user has TV connected
-const checkUserStatus = createServerFn().handler(async () => {
-  // For MVP, we'll use a cookie-based session
-  // In production, use proper session management
-  const userId = 'demo-user' // TODO: Get from cookie/session
-  const session = await getUserSession(userId)
-  return {
-    tvConnected: session?.tvConnected ?? false,
-  }
-})
+const checkUserStatus = createServerFn()
+  .handler(async (ctx: { data: { userId: string | null } }) => {
+    if (!ctx.data.userId) {
+      return { tvConnected: false }
+    }
+
+    const session = await getUserSession(ctx.data.userId)
+    return {
+      tvConnected: session?.tvConnected ?? false,
+    }
+  })
 
 // Server function for quick syntax validation
 const validateSyntax = createServerFn()
@@ -24,15 +26,44 @@ const validateSyntax = createServerFn()
 
 export const Route = createFileRoute('/')({
   component: Home,
-  loader: () => checkUserStatus(),
 })
 
+const DEFAULT_SCRIPT = `//@version=5
+indicator("Test Indicator", overlay=true)
+
+// Simple moving average
+ma20 = ta.sma(close, 20)
+ma50 = ta.sma(close, 50)
+
+// Plot the moving averages
+plot(ma20, color=color.blue, linewidth=2, title="MA 20")
+plot(ma50, color=color.red, linewidth=2, title="MA 50")
+
+// Add a signal when MA crosses
+crossUp = ta.crossover(ma20, ma50)
+crossDown = ta.crossunder(ma20, ma50)
+
+plotshape(crossUp, style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(crossDown, style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+`
+
 function Home() {
-  const { tvConnected } = Route.useLoaderData()
   const navigate = useNavigate()
-  const [script, setScript] = useState('')
+  const [script, setScript] = useState(DEFAULT_SCRIPT)
   const [syntaxIssues, setSyntaxIssues] = useState<string[]>([])
   const [isValidating, setIsValidating] = useState(false)
+  const [tvConnected, setTvConnected] = useState(false)
+
+  useEffect(() => {
+    const checkConnection = async () => {
+      const userId = localStorage.getItem('userId')
+      if (userId) {
+        const result = await checkUserStatus({ data: { userId } })
+        setTvConnected(result.tvConnected)
+      }
+    }
+    checkConnection()
+  }, [])
 
   const handleQuickCheck = async () => {
     if (!script.trim()) return

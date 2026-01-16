@@ -111,9 +111,13 @@ function ValidatePage() {
     setState((s) => ({ ...s, status: 'validating' }))
 
     try {
-      // Run TV validation and AI analysis in parallel
-      const userId = 'demo-user' // TODO: Get from session
+      // Get userId from localStorage
+      const userId = localStorage.getItem('userId')
+      if (!userId) {
+        throw new Error('TradingView not connected')
+      }
 
+      // Run TV validation and AI analysis in parallel
       const [tvResult, aiAnalysis] = await Promise.all([
         validateWithTV({ data: { script, userId } }),
         getAIAnalysis({ data: { script } }),
@@ -152,10 +156,17 @@ function ValidatePage() {
 
     setIsCreatingCheckout(true)
     try {
+      const userId = localStorage.getItem('userId')
+      if (!userId) {
+        alert('TradingView not connected')
+        setIsCreatingCheckout(false)
+        return
+      }
+
       const result = await createCheckout({
         data: {
           script: state.script,
-          userId: 'demo-user', // TODO: Get from session
+          userId,
           title: title.trim(),
           description: description.trim(),
         },
