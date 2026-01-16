@@ -6,9 +6,89 @@ import {
   navigateTo,
   type BrowserlessSession,
 } from './browserless'
+import fs from 'fs'
+import path from 'path'
 
 // Helper function for delays
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// ============ Session Cache (File-based persistence) ============
+const SESSION_CACHE_FILE = path.join(process.cwd(), '.tv-session-cache.json')
+
+interface CachedSession {
+  sessionId: string
+  signature: string
+  createdAt: number
+  expiresAt: number
+  source: 'auto-login' | 'manual' | 'user-login'
+}
+
+/**
+ * Load cached session from file
+ */
+function loadCachedSession(): CachedSession | null {
+  try {
+    if (!fs.existsSync(SESSION_CACHE_FILE)) return null
+    const data = fs.readFileSync(SESSION_CACHE_FILE, 'utf-8')
+    const session: CachedSession = JSON.parse(data)
+
+    // Check if session is expired (with 1 hour buffer)
+    if (Date.now() > session.expiresAt - 60 * 60 * 1000) {
+      console.log('[TV Cache] Cached session expired, removing...')
+      fs.unlinkSync(SESSION_CACHE_FILE)
+      return null
+    }
+
+    console.log(`[TV Cache] Loaded cached session (source: ${session.source}, expires: ${new Date(session.expiresAt).toISOString()})`)
+    return session
+  } catch (error) {
+    console.error('[TV Cache] Failed to load cached session:', error)
+    return null
+  }
+}
+
+/**
+ * Save session to cache file
+ */
+export function saveCachedSession(session: Omit<CachedSession, 'createdAt'>): void {
+  try {
+    const cached: CachedSession = {
+      ...session,
+      createdAt: Date.now(),
+    }
+    fs.writeFileSync(SESSION_CACHE_FILE, JSON.stringify(cached, null, 2))
+    console.log(`[TV Cache] Session cached (expires: ${new Date(session.expiresAt).toISOString()})`)
+  } catch (error) {
+    console.error('[TV Cache] Failed to save session:', error)
+  }
+}
+
+/**
+ * Clear cached session
+ */
+function clearCachedSession(): void {
+  try {
+    if (fs.existsSync(SESSION_CACHE_FILE)) {
+      fs.unlinkSync(SESSION_CACHE_FILE)
+      console.log('[TV Cache] Session cache cleared')
+    }
+  } catch (error) {
+    console.error('[TV Cache] Failed to clear session:', error)
+  }
+}
+
+/**
+ * Get credentials from cache or return null
+ */
+export function getCachedCredentials(): TVCredentials | null {
+  const cached = loadCachedSession()
+  if (!cached) return null
+  return {
+    sessionId: cached.sessionId,
+    signature: cached.signature,
+    userId: cached.source,
+  }
+}
 
 // Environment credentials for auto-login
 const TV_USERNAME = process.env.TV_USERNAME
@@ -110,8 +190,32 @@ const DEV_BYPASS = process.env.NODE_ENV === 'development' && process.env.TV_DEV_
 
 /**
  * Login to TradingView using username/password and extract session cookies
+ * First checks for a valid cached session to avoid CAPTCHA
  */
 export async function loginWithCredentials(): Promise<TVCredentials | null> {
+  // First, check for cached session
+  const cached = loadCachedSession()
+  if (cached) {
+    console.log('[TV] Found cached session, verifying...')
+    const isValid = await verifyTVSession({
+      sessionId: cached.sessionId,
+      signature: cached.signature,
+      userId: cached.source,
+    })
+
+    if (isValid) {
+      console.log('[TV] Cached session is valid, reusing...')
+      return {
+        sessionId: cached.sessionId,
+        signature: cached.signature,
+        userId: cached.source,
+      }
+    } else {
+      console.log('[TV] Cached session is invalid, clearing...')
+      clearCachedSession()
+    }
+  }
+
   if (!TV_USERNAME || !TV_PASSWORD) {
     console.log('[TV] No username/password configured in environment')
     return null
@@ -120,7 +224,7 @@ export async function loginWithCredentials(): Promise<TVCredentials | null> {
   let session: BrowserlessSession | null = null
 
   try {
-    console.log('[TV] Attempting auto-login with environment credentials')
+    console.log('[TV] Attempting auto-login with environment credentials (note: may fail due to CAPTCHA)')
     session = await createBrowserSession()
     const { page } = session
 
@@ -410,6 +514,15 @@ export async function loginWithCredentials(): Promise<TVCredentials | null> {
     }
 
     console.log('[TV] Auto-login successful, cookies extracted')
+
+    // Cache the session for future use (7 days)
+    saveCachedSession({
+      sessionId: sessionIdCookie.value,
+      signature: signatureCookie.value,
+      expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+      source: 'auto-login',
+    })
+
     return {
       sessionId: sessionIdCookie.value,
       signature: signatureCookie.value,
@@ -636,6 +749,15 @@ export async function loginWithUserCredentials(
     }
 
     console.log('[TV] User login successful')
+
+    // Cache the session for future use (7 days)
+    saveCachedSession({
+      sessionId: sessionIdCookie.value,
+      signature: signatureCookie.value,
+      expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+      source: 'user-login',
+    })
+
     return {
       success: true,
       credentials: {

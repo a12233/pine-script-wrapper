@@ -6,6 +6,7 @@ import {
   loginWithCredentials,
   loginWithUserCredentials,
   hasAutoLoginCredentials,
+  saveCachedSession,
 } from '../server/tradingview'
 import { storeTVCredentials, createUserSession, generateUserId } from '../server/kv'
 
@@ -79,6 +80,14 @@ const connectTradingView = createServerFn()
       return { success: false, error: 'Invalid TradingView session. Please check your cookies.' }
     }
 
+    // Cache the session for future use (avoids CAPTCHA issues)
+    saveCachedSession({
+      sessionId,
+      signature,
+      expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000, // 7 days
+      source: 'manual',
+    })
+
     // Create user session and store credentials
     const userId = generateUserId()
     await createUserSession(userId)
@@ -112,7 +121,7 @@ function ConnectPage() {
   const [isAutoLogging, setIsAutoLogging] = useState(false)
   // Shared state
   const [error, setError] = useState('')
-  const [showManualEntry, setShowManualEntry] = useState(false)
+  const [showManualEntry, setShowManualEntry] = useState(true) // Default to showing manual entry
 
   // User credential login
   const handleUserLogin = async () => {
@@ -209,14 +218,111 @@ function ConnectPage() {
         <p>Link your TradingView account to validate and publish scripts</p>
       </div>
 
-      {/* User credential login - primary option for all users */}
+      {/* Manual cookie entry - PRIMARY option (most reliable, bypasses CAPTCHA) */}
       <div className="card">
         <div className="card-header">
-          <h2>Quick Connect</h2>
+          <h2>Connect with Cookies</h2>
           <span className="badge badge-success">Recommended</span>
         </div>
 
-        <p>Enter your TradingView credentials to connect your account.</p>
+        {error && showManualEntry && <div className="error-message" style={{ marginBottom: '1rem' }}>{error}</div>}
+
+        <div className="instructions">
+          <p>Copy your TradingView session cookies to connect (bypasses CAPTCHA):</p>
+          <ol>
+            <li>
+              <strong>Log in to TradingView</strong> in your browser at{' '}
+              <a href="https://www.tradingview.com" target="_blank" rel="noopener noreferrer">
+                tradingview.com
+              </a>
+            </li>
+            <li>
+              Open <strong>Developer Tools</strong> (F12 or Cmd+Option+I)
+            </li>
+            <li>
+              Go to <strong>Application</strong> tab → <strong>Cookies</strong> → tradingview.com
+            </li>
+            <li>
+              Find and copy the value of <code>sessionid</code>
+            </li>
+            <li>
+              Find and copy the value of <code>sessionid_sign</code>
+            </li>
+          </ol>
+        </div>
+
+        <div className="form-group">
+          <label htmlFor="sessionId">Session ID (sessionid cookie)</label>
+          <input
+            id="sessionId"
+            type="text"
+            className="input"
+            value={sessionId}
+            onChange={(e) => setSessionId(e.target.value)}
+            placeholder="Paste your sessionid cookie value"
+          />
+        </div>
+
+        <div className="form-group">
+          <label htmlFor="signature">Signature (sessionid_sign cookie)</label>
+          <input
+            id="signature"
+            type="text"
+            className="input"
+            value={signature}
+            onChange={(e) => setSignature(e.target.value)}
+            placeholder="Paste your sessionid_sign cookie value"
+          />
+        </div>
+
+        <button
+          className="btn btn-primary btn-large"
+          onClick={handleConnect}
+          disabled={isConnecting || !sessionId.trim() || !signature.trim()}
+          style={{ width: '100%', marginTop: '1rem' }}
+        >
+          {isConnecting ? 'Connecting...' : 'Connect with Cookies'}
+        </button>
+
+        <div className="security-note" style={{ marginTop: '1rem' }}>
+          <strong>Security:</strong> Your session cookies are encrypted and cached locally.
+          They will be reused for up to 7 days to avoid re-authentication.
+        </div>
+      </div>
+
+      {/* Admin auto-login option - only shown if server credentials are configured */}
+      {autoLoginAvailable && (
+        <div className="card">
+          <div className="card-header">
+            <h2>Admin Quick Connect</h2>
+          </div>
+
+          <p>Auto-login using server-configured credentials (uses cached session if available).</p>
+
+          {error && !showManualEntry && <div className="error-message" style={{ marginBottom: '1rem' }}>{error}</div>}
+
+          <button
+            className="btn btn-secondary"
+            onClick={handleAutoLogin}
+            disabled={isAutoLogging}
+            style={{ width: '100%', marginTop: '1rem' }}
+          >
+            {isAutoLogging ? 'Connecting...' : 'Connect with Server Credentials'}
+          </button>
+        </div>
+      )}
+
+      {/* User credential login - alternative option (may trigger CAPTCHA) */}
+      <div className="card">
+        <div className="card-header">
+          <h2>Login with Credentials</h2>
+          <span className="badge" style={{ background: 'var(--text-secondary)', color: 'white' }}>Alternative</span>
+        </div>
+
+        <p style={{ color: 'var(--text-secondary)', marginBottom: '1rem' }}>
+          <strong>Note:</strong> This method may trigger CAPTCHA verification.
+          Use "Connect with Cookies" above for reliable access.
+        </p>
 
         <div className="form-group">
           <label htmlFor="tvUsername">TradingView Username or Email</label>
@@ -248,126 +354,13 @@ function ConnectPage() {
         {error && !showManualEntry && <div className="error-message">{error}</div>}
 
         <button
-          className="btn btn-primary btn-large"
+          className="btn btn-secondary"
           onClick={handleUserLogin}
           disabled={isUserLogging || !tvUsername.trim() || !tvPassword.trim()}
           style={{ width: '100%', marginTop: '1rem' }}
         >
-          {isUserLogging ? 'Connecting...' : 'Connect Account'}
+          {isUserLogging ? 'Connecting...' : 'Try Login'}
         </button>
-
-        <div className="security-note" style={{ marginTop: '1rem' }}>
-          <strong>Security Note:</strong> Your password is used only to log in and is never stored.
-          Only your session token is saved (encrypted) to keep you connected.
-        </div>
-      </div>
-
-      {/* Admin auto-login option - only shown if server credentials are configured */}
-      {autoLoginAvailable && (
-        <div className="card">
-          <div className="card-header">
-            <h2>Admin Quick Connect</h2>
-          </div>
-
-          <p>Auto-login using server-configured credentials.</p>
-
-          <button
-            className="btn btn-secondary"
-            onClick={handleAutoLogin}
-            disabled={isAutoLogging}
-            style={{ width: '100%', marginTop: '1rem' }}
-          >
-            {isAutoLogging ? 'Connecting...' : 'Connect with Server Credentials'}
-          </button>
-        </div>
-      )}
-
-      {/* Manual cookie entry - fallback option */}
-      <div className="card">
-        <div className="card-header">
-          <h2>Manual Cookie Entry</h2>
-          {!showManualEntry && (
-            <button
-              className="btn btn-sm btn-secondary"
-              onClick={() => setShowManualEntry(!showManualEntry)}
-            >
-              {showManualEntry ? 'Hide' : 'Show'}
-            </button>
-          )}
-        </div>
-
-        {showManualEntry && (
-          <>
-            {error && <div className="error-message" style={{ marginBottom: '1rem' }}>{error}</div>}
-
-            <div className="instructions">
-              <p>If the quick connect doesn't work, you can manually enter your session cookies:</p>
-              <ol>
-                <li>
-                  <strong>Log in to TradingView</strong> in your browser
-                </li>
-                <li>
-                  Open <strong>Developer Tools</strong> (F12 or Cmd+Option+I)
-                </li>
-                <li>
-                  Go to <strong>Application</strong> tab → <strong>Cookies</strong> → tradingview.com
-                </li>
-                <li>
-                  Find and copy the value of <code>sessionid</code>
-                </li>
-                <li>
-                  Find and copy the value of <code>sessionid_sign</code>
-                </li>
-              </ol>
-            </div>
-
-            <div className="form-group">
-              <label htmlFor="sessionId">Session ID (sessionid cookie)</label>
-              <input
-                id="sessionId"
-                type="text"
-                className="input"
-                value={sessionId}
-                onChange={(e) => setSessionId(e.target.value)}
-                placeholder="Paste your sessionid cookie value"
-              />
-            </div>
-
-            <div className="form-group">
-              <label htmlFor="signature">Signature (sessionid_sign cookie)</label>
-              <input
-                id="signature"
-                type="text"
-                className="input"
-                value={signature}
-                onChange={(e) => setSignature(e.target.value)}
-                placeholder="Paste your sessionid_sign cookie value"
-              />
-            </div>
-
-            <div className="button-group">
-              <button
-                className="btn btn-secondary"
-                onClick={() => setShowManualEntry(false)}
-              >
-                Cancel
-              </button>
-              <button
-                className="btn btn-primary"
-                onClick={handleConnect}
-                disabled={isConnecting || !sessionId.trim() || !signature.trim()}
-              >
-                {isConnecting ? 'Connecting...' : 'Connect with Cookies'}
-              </button>
-            </div>
-          </>
-        )}
-
-        {!showManualEntry && (
-          <p style={{ color: 'var(--text-secondary)' }}>
-            Having trouble with Quick Connect? Click "Show" to manually enter your session cookies.
-          </p>
-        )}
       </div>
     </div>
   )
