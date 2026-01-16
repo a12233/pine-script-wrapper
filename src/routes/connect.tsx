@@ -81,6 +81,8 @@ function ConnectPage() {
       const result = await autoLoginTradingView()
 
       if (result.success) {
+        // Store userId in localStorage
+        localStorage.setItem('userId', result.userId)
         navigate({ to: '/' })
       } else {
         setError(result.error || 'Auto-login failed')
@@ -108,6 +110,8 @@ function ConnectPage() {
       })
 
       if (result.success) {
+        // Store userId in localStorage
+        localStorage.setItem('userId', result.userId)
         navigate({ to: '/' })
       } else {
         setError(result.error || 'Failed to connect')
@@ -127,9 +131,32 @@ function ConnectPage() {
         <p>Link your TradingView account to validate and publish scripts</p>
       </div>
 
+      {/* Auto-login option */}
+      {autoLoginAvailable && (
+        <div className="card">
+          <div className="card-header">
+            <h2>Quick Connect</h2>
+            <span className="badge badge-success">Recommended</span>
+          </div>
+
+          <p>Auto-login using configured credentials.</p>
+
+          {error && <div className="error-message">{error}</div>}
+
+          <button
+            className="btn btn-primary btn-large"
+            onClick={handleAutoLogin}
+            disabled={isAutoLogging}
+            style={{ width: '100%', marginTop: '1rem' }}
+          >
+            {isAutoLogging ? 'Connecting...' : 'Connect Automatically'}
+          </button>
+        </div>
+      )}
+
       <div className="card">
         <div className="card-header">
-          <h2>How to Get Your Cookies</h2>
+          <h2>{autoLoginAvailable ? 'Manual Connect (Alternative)' : 'How to Get Your Cookies'}</h2>
         </div>
 
         <div className="instructions">

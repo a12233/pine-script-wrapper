@@ -14,7 +14,7 @@ import * as readline from 'readline'
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 // TradingView credentials (for testing only)
-const TV_USERNAME = process.env.TV_USERNAME || 'pug0ngying'
+const TV_USERNAME = process.env.TV_USERNAME || ''
 const TV_PASSWORD = process.env.TV_PASSWORD || ''
 
 // Test Pine Script
