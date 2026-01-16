@@ -21,5 +21,5 @@ primary_region = 'sjc'
   processes = ['app']
 
 [[vm]]
-  memory = '256mb'
+  memory = '512mb'
   cpus = 1

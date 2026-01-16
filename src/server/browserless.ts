@@ -6,6 +6,7 @@ const BROWSERLESS_ENDPOINT = process.env.BROWSERLESS_ENDPOINT || 'wss://chrome.b
 const USE_LOCAL_BROWSER = process.env.USE_LOCAL_BROWSER === 'true'
 const CHROME_PATH = process.env.CHROME_PATH
 const CHROME_USER_DATA_DIR = process.env.CHROME_USER_DATA_DIR // Use existing Chrome profile
+const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH // Set by Dockerfile for production
 
 /**
  * Auto-detect Chrome user data directory based on OS
@@ -71,7 +72,10 @@ export interface BrowserlessSession {
 }
 
 /**
- * Create a browser session - uses local Chrome in dev, Browserless.io in production
+ * Create a browser session
+ * - Uses visible Chrome window in dev (USE_LOCAL_BROWSER=true)
+ * - Uses headless Chromium in production container (PUPPETEER_EXECUTABLE_PATH set)
+ * - Falls back to Browserless.io if neither is available
  */
 export async function createBrowserSession(): Promise<BrowserlessSession> {
   let browser: Browser
@@ -100,18 +104,42 @@ export async function createBrowserSession(): Promise<BrowserlessSession> {
       args,
       defaultViewport: null, // Use default window size
     })
-  } else {
-    // Connect to Browserless.io (production)
-    if (!BROWSERLESS_API_KEY) {
-      throw new Error(
-        'BROWSERLESS_API_KEY is required when USE_LOCAL_BROWSER is not set. ' +
-          'Set USE_LOCAL_BROWSER=true for local development.'
-      )
-    }
+  } else if (PUPPETEER_EXECUTABLE_PATH) {
+    // Production mode: Launch headless Chromium in container
+    // This is set in Dockerfile: PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+    console.log(`🌐 Launching headless Chromium: ${PUPPETEER_EXECUTABLE_PATH}`)
+
+    const args = [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-software-rasterizer',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process', // Required for some container environments
+    ]
+
+    browser = await puppeteer.launch({
+      headless: true,
+      executablePath: PUPPETEER_EXECUTABLE_PATH,
+      args,
+      defaultViewport: { width: 1920, height: 1080 },
+    })
+  } else if (BROWSERLESS_API_KEY) {
+    // Fallback: Connect to Browserless.io
     console.log('🌐 Connecting to Browserless.io...')
     browser = await puppeteer.connect({
       browserWSEndpoint: `${BROWSERLESS_ENDPOINT}?token=${BROWSERLESS_API_KEY}`,
     })
+  } else {
+    throw new Error(
+      'No browser available. Set one of: USE_LOCAL_BROWSER=true, PUPPETEER_EXECUTABLE_PATH, or BROWSERLESS_API_KEY'
+    )
   }
 
   const page = await browser.newPage()
