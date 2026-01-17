@@ -6,7 +6,6 @@ import {
   loginWithCredentials,
   loginWithUserCredentials,
   hasAutoLoginCredentials,
-  saveCachedSession,
 } from '../server/tradingview'
 import { storeTVCredentials, createUserSession, generateUserId } from '../server/kv'
 
@@ -80,15 +79,9 @@ const connectTradingView = createServerFn()
       return { success: false, error: 'Invalid TradingView session. Please check your cookies.' }
     }
 
-    // Cache the session for future use (avoids CAPTCHA issues)
-    saveCachedSession({
-      sessionId,
-      signature,
-      expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000, // 7 days
-      source: 'manual',
-    })
-
     // Create user session and store credentials
+    // Note: Session is stored per-user in Redis/KV via storeTVCredentials() below
+    // This ensures proper isolation between users
     const userId = generateUserId()
     await createUserSession(userId)
     await storeTVCredentials(userId, {
@@ -285,8 +278,8 @@ function ConnectPage() {
         </button>
 
         <div className="security-note" style={{ marginTop: '1rem' }}>
-          <strong>Security:</strong> Your session cookies are encrypted and cached locally.
-          They will be reused for up to 7 days to avoid re-authentication.
+          <strong>Security:</strong> Your session cookies are encrypted and stored securely per-user.
+          They are never shared between users and expire after 7 days.
         </div>
       </div>
 
