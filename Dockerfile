@@ -5,8 +5,10 @@ ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 RUN corepack enable
 
-# Install dependencies for Puppeteer (Chrome)
+# Install build tools for native addons and dependencies for Puppeteer (Chrome)
 RUN apt-get update && apt-get install -y \
+    build-essential \
+    python3 \
     chromium \
     fonts-liberation \
     libasound2 \

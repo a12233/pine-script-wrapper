@@ -4,6 +4,7 @@ import fs from 'fs'
 const BROWSERLESS_API_KEY = process.env.BROWSERLESS_API_KEY
 const BROWSERLESS_ENDPOINT = process.env.BROWSERLESS_ENDPOINT || 'wss://chrome.browserless.io'
 const USE_LOCAL_BROWSER = process.env.USE_LOCAL_BROWSER === 'true'
+const HEADLESS_BROWSER = process.env.HEADLESS_BROWSER === 'true' // Run browser in background (headless)
 const CHROME_PATH = process.env.CHROME_PATH
 const CHROME_USER_DATA_DIR = process.env.CHROME_USER_DATA_DIR // Use existing Chrome profile
 const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH // Set by Dockerfile for production
@@ -81,7 +82,8 @@ export async function createBrowserSession(): Promise<BrowserlessSession> {
   let browser: Browser
 
   if (USE_LOCAL_BROWSER) {
-    // Launch local Chrome (dev mode - browser window is visible for debugging)
+    // Launch local Chrome
+    // Options: HEADLESS_BROWSER=true for invisible, otherwise launches minimized
     const chromePath = getChromePath()
 
     // Use custom profile dir if set, otherwise use a puppeteer-specific profile
@@ -95,14 +97,21 @@ export async function createBrowserSession(): Promise<BrowserlessSession> {
       `--user-data-dir=${userDataDir}`,
     ]
 
-    console.log(`🌐 Launching Chrome: ${chromePath}`)
+    // Launch minimized/hidden by default (unless headless)
+    // Note: --start-minimized doesn't work on Linux, so we position window off-screen instead
+    if (!HEADLESS_BROWSER) {
+      args.push('--window-position=-2400,-2400')
+    }
+
+    const headless = HEADLESS_BROWSER ? 'new' : false
+    console.log(`🌐 Launching Chrome: ${chromePath} (headless: ${headless}, off-screen: ${!HEADLESS_BROWSER})`)
     console.log(`   Profile: ${userDataDir}`)
 
     browser = await puppeteer.launch({
-      headless: false,
+      headless,
       executablePath: chromePath,
       args,
-      defaultViewport: null, // Use default window size
+      defaultViewport: headless ? { width: 1920, height: 1080 } : null,
     })
   } else if (PUPPETEER_EXECUTABLE_PATH) {
     // Production mode: Launch headless Chromium in container
@@ -120,8 +129,10 @@ export async function createBrowserSession(): Promise<BrowserlessSession> {
       '--disable-default-apps',
       '--disable-sync',
       '--no-first-run',
-      '--no-zygote',
-      '--single-process', // Required for some container environments
+      '--disable-accelerated-2d-canvas',
+      '--disable-canvas-aa',
+      '--disable-2d-canvas-clip-aa',
+      '--disable-gl-drawing-for-tests',
     ]
 
     browser = await puppeteer.launch({
@@ -143,6 +154,12 @@ export async function createBrowserSession(): Promise<BrowserlessSession> {
   }
 
   const page = await browser.newPage()
+
+  // Auto-accept all dialogs (including beforeunload "are you sure" prompts)
+  page.on('dialog', async (dialog) => {
+    console.log(`[Browser] Auto-accepting dialog: ${dialog.type()} - "${dialog.message()}"`)
+    await dialog.accept()
+  })
 
   // Set a realistic viewport
   await page.setViewport({ width: 1920, height: 1080 })

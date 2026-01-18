@@ -118,6 +118,7 @@ export interface PublishJob {
   script: string
   title: string
   description: string
+  visibility: 'public' | 'private'
   stripeSessionId: string
   status: 'pending' | 'processing' | 'completed' | 'failed'
   indicatorUrl?: string

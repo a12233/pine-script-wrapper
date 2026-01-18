@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { createServerFn } from '@tanstack/react-start'
 import { validatePineScript } from '../server/tradingview'
 import { analyzePineScript, generateCorrections } from '../server/ai'
@@ -58,8 +58,8 @@ const getAICorrections = createServerFn()
 
 // Server function to create checkout session
 const createCheckout = createServerFn()
-  .handler(async (ctx: { data: { script: string; userId: string; title: string; description: string } }) => {
-    const { script, userId, title, description } = ctx.data
+  .handler(async (ctx: { data: { script: string; userId: string; title: string; description: string; visibility: 'public' | 'private' } }) => {
+    const { script, userId, title, description, visibility } = ctx.data
     const scriptHash = hashScript(script)
 
     // Create checkout session
@@ -75,6 +75,7 @@ const createCheckout = createServerFn()
       script,
       title,
       description,
+      visibility,
       stripeSessionId: checkout.sessionId,
     })
 
@@ -93,12 +94,22 @@ function ValidatePage() {
   })
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
+  const [visibility, setVisibility] = useState<'public' | 'private'>('public')
   const [isCreatingCheckout, setIsCreatingCheckout] = useState(false)
 
   // Load script from session storage on mount
+  // Use ref to prevent double validation in React StrictMode
+  const validationStartedRef = useRef(false)
+
   useEffect(() => {
+    // Prevent double validation from React StrictMode
+    if (validationStartedRef.current) {
+      return
+    }
+
     const pendingScript = sessionStorage.getItem('pendingScript')
     if (pendingScript) {
+      validationStartedRef.current = true
       setState((s) => ({ ...s, script: pendingScript }))
       // Start validation
       runValidation(pendingScript)
@@ -169,6 +180,7 @@ function ValidatePage() {
           userId,
           title: title.trim(),
           description: description.trim(),
+          visibility,
         },
       })
 
@@ -329,6 +341,34 @@ function ValidatePage() {
                   placeholder="Describe what your indicator does..."
                   rows={3}
                 />
+              </div>
+
+              <div className="form-group">
+                <label>Visibility</label>
+                <div className="visibility-options">
+                  <label className="radio-label">
+                    <input
+                      type="radio"
+                      name="visibility"
+                      value="public"
+                      checked={visibility === 'public'}
+                      onChange={() => setVisibility('public')}
+                    />
+                    <span>Public</span>
+                    <small>Anyone can view and use your indicator</small>
+                  </label>
+                  <label className="radio-label">
+                    <input
+                      type="radio"
+                      name="visibility"
+                      value="private"
+                      checked={visibility === 'private'}
+                      onChange={() => setVisibility('private')}
+                    />
+                    <span>Private</span>
+                    <small>Only you can see and use this indicator</small>
+                  </label>
+                </div>
               </div>
 
               <div className="price-info">

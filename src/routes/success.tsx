@@ -32,6 +32,11 @@ const checkJobStatus = createServerFn()
       return { status: 'failed' as const, error: job.error }
     }
 
+    // If already processing, just wait (don't start another publish)
+    if (job.status === 'processing') {
+      return { status: 'publishing' as const }
+    }
+
     // Check if payment was successful
     const checkout = await getCheckoutSession(sessionId)
     if (checkout.payment_status !== 'paid') {
@@ -52,14 +57,23 @@ const checkJobStatus = createServerFn()
     }
 
     // Publish the script
-    const result = await publishPineScript(credentials, job.script, job.title, job.description)
+    const result = await publishPineScript(credentials, {
+      script: job.script,
+      title: job.title,
+      description: job.description,
+      visibility: job.visibility,
+    })
 
-    if (result.success && result.indicatorUrl) {
+    if (result.success) {
       await updatePublishJob(job.jobId, {
         status: 'completed',
-        indicatorUrl: result.indicatorUrl,
+        indicatorUrl: result.indicatorUrl || 'URL not available - check TradingView',
       })
-      return { status: 'success' as const, indicatorUrl: result.indicatorUrl }
+      return {
+        status: 'success' as const,
+        indicatorUrl: result.indicatorUrl || undefined,
+        // Note: URL may be undefined for private scripts
+      }
     } else {
       await updatePublishJob(job.jobId, {
         status: 'failed',
@@ -130,7 +144,7 @@ function SuccessPage() {
           <h2>Published Successfully!</h2>
           <p>Your Pine Script indicator is now live on TradingView.</p>
 
-          {jobStatus.indicatorUrl && (
+          {jobStatus.indicatorUrl ? (
             <div className="indicator-url">
               <label>Your Indicator URL:</label>
               <a href={jobStatus.indicatorUrl} target="_blank" rel="noopener noreferrer">
@@ -142,6 +156,19 @@ function SuccessPage() {
               >
                 Copy URL
               </button>
+            </div>
+          ) : (
+            <div className="indicator-url">
+              <p>Your script has been published as a private indicator.</p>
+              <p>
+                <a
+                  href="https://www.tradingview.com/u/#published-scripts"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  View your published scripts on TradingView →
+                </a>
+              </p>
             </div>
           )}
 
