@@ -10,6 +10,58 @@ import {
 // Helper function for delays
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
+// ============ Admin Session Cache (In-memory only, for server-level credentials) ============
+// This cache is ONLY for admin auto-login with TV_USERNAME/TV_PASSWORD environment variables.
+// It is NOT used for user sessions - those are stored per-user in Redis/KV via kv.ts.
+interface AdminCachedSession {
+  sessionId: string
+  signature: string
+  createdAt: number
+  expiresAt: number
+}
+
+let adminSessionCache: AdminCachedSession | null = null
+
+/**
+ * Load admin cached session from memory
+ * Only used for server-level auto-login, not for user sessions
+ */
+function loadAdminCachedSession(): AdminCachedSession | null {
+  if (!adminSessionCache) return null
+
+  // Check if session is expired (with 1 hour buffer)
+  if (Date.now() > adminSessionCache.expiresAt - 60 * 60 * 1000) {
+    console.log('[TV Admin Cache] Cached session expired, clearing...')
+    adminSessionCache = null
+    return null
+  }
+
+  console.log(`[TV Admin Cache] Using cached admin session (expires: ${new Date(adminSessionCache.expiresAt).toISOString()})`)
+  return adminSessionCache
+}
+
+/**
+ * Save admin session to in-memory cache
+ * Only used for server-level auto-login with environment credentials
+ */
+function saveAdminCachedSession(session: Omit<AdminCachedSession, 'createdAt'>): void {
+  adminSessionCache = {
+    ...session,
+    createdAt: Date.now(),
+  }
+  console.log(`[TV Admin Cache] Admin session cached in memory (expires: ${new Date(session.expiresAt).toISOString()})`)
+}
+
+/**
+ * Clear admin cached session
+ */
+function clearAdminCachedSession(): void {
+  if (adminSessionCache) {
+    adminSessionCache = null
+    console.log('[TV Admin Cache] Admin session cache cleared')
+  }
+}
+
 // Environment credentials for auto-login
 const TV_USERNAME = process.env.TV_USERNAME
 const TV_PASSWORD = process.env.TV_PASSWORD
@@ -109,7 +161,9 @@ export function parseTVCookies(credentials: TVCredentials): Array<{
 const DEV_BYPASS = process.env.NODE_ENV === 'development' && process.env.TV_DEV_BYPASS === 'true'
 
 /**
- * Login to TradingView using username/password and extract session cookies
+ * Login to TradingView using server-configured credentials (TV_USERNAME/TV_PASSWORD)
+ * First checks for a valid cached admin session to avoid CAPTCHA
+ * Note: This is for admin/server-level login only. User sessions are handled separately via kv.ts.
  */
 export async function loginWithCredentials(): Promise<TVCredentials | null> {
   if (!TV_USERNAME || !TV_PASSWORD) {
@@ -117,10 +171,33 @@ export async function loginWithCredentials(): Promise<TVCredentials | null> {
     return null
   }
 
+  // First, check for cached admin session
+  const cached = loadAdminCachedSession()
+  if (cached) {
+    console.log('[TV] Found cached admin session, verifying...')
+    const isValid = await verifyTVSession({
+      sessionId: cached.sessionId,
+      signature: cached.signature,
+      userId: 'admin',
+    })
+
+    if (isValid) {
+      console.log('[TV] Cached admin session is valid, reusing...')
+      return {
+        sessionId: cached.sessionId,
+        signature: cached.signature,
+        userId: 'admin',
+      }
+    } else {
+      console.log('[TV] Cached admin session is invalid, clearing...')
+      clearAdminCachedSession()
+    }
+  }
+
   let session: BrowserlessSession | null = null
 
   try {
-    console.log('[TV] Attempting auto-login with environment credentials')
+    console.log('[TV] Attempting auto-login with environment credentials (note: may fail due to CAPTCHA)')
     session = await createBrowserSession()
     const { page } = session
 
@@ -410,14 +487,255 @@ export async function loginWithCredentials(): Promise<TVCredentials | null> {
     }
 
     console.log('[TV] Auto-login successful, cookies extracted')
+
+    // Cache the admin session in memory for future use (7 days)
+    saveAdminCachedSession({
+      sessionId: sessionIdCookie.value,
+      signature: signatureCookie.value,
+      expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+    })
+
     return {
       sessionId: sessionIdCookie.value,
       signature: signatureCookie.value,
-      userId: 'auto-login',
+      userId: 'admin',
     }
   } catch (error) {
     console.error('[TV] Auto-login failed:', error)
     return null
+  } finally {
+    if (session) {
+      await closeBrowserSession(session)
+    }
+  }
+}
+
+/**
+ * Result of user credential login attempt
+ */
+export interface UserLoginResult {
+  success: boolean
+  credentials?: TVCredentials
+  error?: string
+  captchaDetected?: boolean
+}
+
+/**
+ * Login to TradingView using user-provided credentials (for hosted users)
+ * This runs headless and cannot handle CAPTCHA - returns error if detected
+ */
+export async function loginWithUserCredentials(
+  username: string,
+  password: string
+): Promise<UserLoginResult> {
+  if (!username || !password) {
+    return { success: false, error: 'Username and password are required' }
+  }
+
+  let session: BrowserlessSession | null = null
+
+  try {
+    console.log('[TV] Attempting login with user-provided credentials')
+    session = await createBrowserSession()
+    const { page } = session
+
+    // Navigate to TradingView login page
+    await navigateTo(page, 'https://www.tradingview.com/accounts/signin/')
+    await delay(3000)
+
+    // Check if already logged in
+    let currentUrl = page.url()
+    if (!currentUrl.includes('signin')) {
+      // Clear any existing session and start fresh
+      await page.deleteCookie(...(await page.cookies()))
+      await navigateTo(page, 'https://www.tradingview.com/accounts/signin/')
+      await delay(3000)
+    }
+
+    // Click "Email" tab
+    const emailTabSelectors = [
+      'button[name="Email"]',
+      '[data-name="email"]',
+      'button:has-text("Email")',
+      '.tv-signin-dialog__toggle-email',
+    ]
+
+    for (const selector of emailTabSelectors) {
+      try {
+        const element = await page.$(selector)
+        if (element) {
+          await element.click()
+          console.log(`[TV] Clicked email tab: ${selector}`)
+          await delay(1000)
+          break
+        }
+      } catch {
+        // Try next
+      }
+    }
+
+    // Try clicking by text content as fallback
+    await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button, span, div'))
+      const emailBtn = buttons.find(el => el.textContent?.trim().toLowerCase() === 'email')
+      if (emailBtn) (emailBtn as HTMLElement).click()
+    })
+    await delay(1000)
+
+    // Find and fill username
+    const usernameSelectors = [
+      'input[name="id_username"]',
+      'input[name="username"]',
+      'input[type="email"]',
+      'input[placeholder*="email" i]',
+      '#id_username',
+    ]
+
+    let usernameInput = null
+    for (const selector of usernameSelectors) {
+      usernameInput = await page.$(selector)
+      if (usernameInput) break
+    }
+
+    if (!usernameInput) {
+      return { success: false, error: 'Could not find login form. TradingView may have changed their UI.' }
+    }
+
+    await usernameInput.click()
+    await delay(200)
+    await usernameInput.type(username, { delay: 30 })
+    await delay(500)
+
+    // Find and fill password
+    const passwordSelectors = [
+      'input[name="id_password"]',
+      'input[name="password"]',
+      'input[type="password"]',
+      '#id_password',
+    ]
+
+    let passwordInput = null
+    for (const selector of passwordSelectors) {
+      passwordInput = await page.$(selector)
+      if (passwordInput) break
+    }
+
+    if (!passwordInput) {
+      return { success: false, error: 'Could not find password field' }
+    }
+
+    await passwordInput.click()
+    await delay(200)
+    await passwordInput.type(password, { delay: 30 })
+    await delay(500)
+
+    // Submit
+    const submitSelectors = [
+      'button[type="submit"]',
+      'button[data-overflow-tooltip-text="Sign in"]',
+      '.tv-button--primary',
+    ]
+
+    let submitClicked = false
+    for (const selector of submitSelectors) {
+      try {
+        const btn = await page.$(selector)
+        if (btn) {
+          await btn.click()
+          submitClicked = true
+          break
+        }
+      } catch {
+        // Try next
+      }
+    }
+
+    if (!submitClicked) {
+      await page.keyboard.press('Enter')
+    }
+
+    // Wait for response
+    await delay(3000)
+
+    // Check for CAPTCHA - in headless mode we can't solve it
+    const hasCaptcha = await page.evaluate(() => {
+      const recaptchaFrame = document.querySelector('iframe[src*="recaptcha"]')
+      const checkbox = document.querySelector('.recaptcha-checkbox')
+      return !!(recaptchaFrame || checkbox)
+    })
+
+    if (hasCaptcha) {
+      console.log('[TV] CAPTCHA detected - cannot solve in headless mode')
+      return {
+        success: false,
+        error: 'CAPTCHA verification required. Please use manual cookie method instead.',
+        captchaDetected: true,
+      }
+    }
+
+    // Wait for login to complete
+    await delay(3000)
+
+    // Check for login errors
+    const loginError = await page.evaluate(() => {
+      const errorEl = document.querySelector('.tv-form-error, .error-message, [data-error]')
+      return errorEl?.textContent?.trim() || null
+    })
+
+    if (loginError) {
+      return { success: false, error: `Login failed: ${loginError}` }
+    }
+
+    // Check if login was successful
+    currentUrl = page.url()
+    const userMenuSelectors = [
+      '[data-name="header-user-menu-button"]',
+      '.tv-header__user-menu-button',
+      'button[aria-label="Open user menu"]',
+    ]
+
+    let isLoggedIn = false
+    for (const selector of userMenuSelectors) {
+      const userMenu = await page.$(selector)
+      if (userMenu) {
+        isLoggedIn = true
+        break
+      }
+    }
+
+    if (!isLoggedIn && !currentUrl.includes('signin')) {
+      isLoggedIn = true
+    }
+
+    if (!isLoggedIn) {
+      return { success: false, error: 'Login failed. Please check your credentials.' }
+    }
+
+    // Extract cookies
+    const cookies = await page.cookies('https://www.tradingview.com')
+    const sessionIdCookie = cookies.find(c => c.name === 'sessionid')
+    const signatureCookie = cookies.find(c => c.name === 'sessionid_sign')
+
+    if (!sessionIdCookie || !signatureCookie) {
+      return { success: false, error: 'Login succeeded but could not extract session' }
+    }
+
+    console.log('[TV] User login successful')
+
+    // Note: Session is stored per-user in Redis/KV via connect.tsx -> storeTVCredentials()
+    // No global caching here to prevent cross-user credential leakage
+
+    return {
+      success: true,
+      credentials: {
+        sessionId: sessionIdCookie.value,
+        signature: signatureCookie.value,
+        userId: 'user-login',
+      },
+    }
+  } catch (error) {
+    console.error('[TV] User login failed:', error)
+    return { success: false, error: `Login error: ${(error as Error).message}` }
   } finally {
     if (session) {
       await closeBrowserSession(session)

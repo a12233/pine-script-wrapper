@@ -1,7 +1,12 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useState } from 'react'
 import { createServerFn } from '@tanstack/react-start'
-import { verifyTVSession, loginWithCredentials, hasAutoLoginCredentials } from '../server/tradingview'
+import {
+  verifyTVSession,
+  loginWithCredentials,
+  loginWithUserCredentials,
+  hasAutoLoginCredentials,
+} from '../server/tradingview'
 import { storeTVCredentials, createUserSession, generateUserId } from '../server/kv'
 
 // Check if auto-login is available
@@ -30,6 +35,34 @@ const autoLoginTradingView = createServerFn().handler(async () => {
   return { success: true, userId }
 })
 
+// Server function for user credential login
+const userLoginTradingView = createServerFn()
+  .handler(async (ctx: { data: { username: string; password: string } }) => {
+    const { username, password } = ctx.data
+
+    const result = await loginWithUserCredentials(username, password)
+
+    if (!result.success || !result.credentials) {
+      return {
+        success: false,
+        error: result.error || 'Login failed',
+        captchaDetected: result.captchaDetected,
+      }
+    }
+
+    // Create user session and store credentials
+    const userId = generateUserId()
+    await createUserSession(userId)
+    await storeTVCredentials(userId, {
+      sessionId: result.credentials.sessionId,
+      signature: result.credentials.signature,
+      userId,
+      expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000, // 7 days
+    })
+
+    return { success: true, userId }
+  })
+
 // Server function to verify and store TV credentials (manual cookie entry)
 const connectTradingView = createServerFn()
   .handler(async (ctx: { data: { sessionId: string; signature: string } }) => {
@@ -47,6 +80,8 @@ const connectTradingView = createServerFn()
     }
 
     // Create user session and store credentials
+    // Note: Session is stored per-user in Redis/KV via storeTVCredentials() below
+    // This ensures proper isolation between users
     const userId = generateUserId()
     await createUserSession(userId)
     await storeTVCredentials(userId, {
@@ -67,12 +102,58 @@ export const Route = createFileRoute('/connect')({
 function ConnectPage() {
   const { available: autoLoginAvailable } = Route.useLoaderData()
   const navigate = useNavigate()
+  // User credential login state
+  const [tvUsername, setTvUsername] = useState('')
+  const [tvPassword, setTvPassword] = useState('')
+  const [isUserLogging, setIsUserLogging] = useState(false)
+  // Manual cookie entry state
   const [sessionId, setSessionId] = useState('')
   const [signature, setSignature] = useState('')
   const [isConnecting, setIsConnecting] = useState(false)
+  // Admin auto-login state
   const [isAutoLogging, setIsAutoLogging] = useState(false)
+  // Shared state
   const [error, setError] = useState('')
+  const [showManualEntry, setShowManualEntry] = useState(true) // Default to showing manual entry
 
+  // User credential login
+  const handleUserLogin = async () => {
+    if (!tvUsername.trim() || !tvPassword.trim()) {
+      setError('Please enter your TradingView username and password')
+      return
+    }
+
+    setIsUserLogging(true)
+    setError('')
+
+    try {
+      const result = await userLoginTradingView({
+        data: { username: tvUsername.trim(), password: tvPassword },
+      })
+
+      if (result.success) {
+        localStorage.setItem('userId', result.userId)
+        navigate({ to: '/' })
+      } else {
+        if (result.captchaDetected) {
+          setError('CAPTCHA verification required. Please use the manual cookie method below.')
+          setShowManualEntry(true)
+        } else {
+          setError(result.error || 'Login failed')
+        }
+      }
+    } catch (err) {
+      setError('Login failed. Please try the manual cookie method.')
+      setShowManualEntry(true)
+      console.error(err)
+    } finally {
+      setIsUserLogging(false)
+      // Clear password from memory
+      setTvPassword('')
+    }
+  }
+
+  // Admin auto-login with env credentials
   const handleAutoLogin = async () => {
     setIsAutoLogging(true)
     setError('')
@@ -81,7 +162,6 @@ function ConnectPage() {
       const result = await autoLoginTradingView()
 
       if (result.success) {
-        // Store userId in localStorage
         localStorage.setItem('userId', result.userId)
         navigate({ to: '/' })
       } else {
@@ -95,6 +175,7 @@ function ConnectPage() {
     }
   }
 
+  // Manual cookie entry
   const handleConnect = async () => {
     if (!sessionId.trim() || !signature.trim()) {
       setError('Please enter both session ID and signature')
@@ -110,7 +191,6 @@ function ConnectPage() {
       })
 
       if (result.success) {
-        // Store userId in localStorage
         localStorage.setItem('userId', result.userId)
         navigate({ to: '/' })
       } else {
@@ -131,38 +211,23 @@ function ConnectPage() {
         <p>Link your TradingView account to validate and publish scripts</p>
       </div>
 
-      {/* Auto-login option */}
-      {autoLoginAvailable && (
-        <div className="card">
-          <div className="card-header">
-            <h2>Quick Connect</h2>
-            <span className="badge badge-success">Recommended</span>
-          </div>
-
-          <p>Auto-login using configured credentials.</p>
-
-          {error && <div className="error-message">{error}</div>}
-
-          <button
-            className="btn btn-primary btn-large"
-            onClick={handleAutoLogin}
-            disabled={isAutoLogging}
-            style={{ width: '100%', marginTop: '1rem' }}
-          >
-            {isAutoLogging ? 'Connecting...' : 'Connect Automatically'}
-          </button>
-        </div>
-      )}
-
+      {/* Manual cookie entry - PRIMARY option (most reliable, bypasses CAPTCHA) */}
       <div className="card">
         <div className="card-header">
-          <h2>{autoLoginAvailable ? 'Manual Connect (Alternative)' : 'How to Get Your Cookies'}</h2>
+          <h2>Connect with Cookies</h2>
+          <span className="badge badge-success">Recommended</span>
         </div>
 
+        {error && showManualEntry && <div className="error-message" style={{ marginBottom: '1rem' }}>{error}</div>}
+
         <div className="instructions">
+          <p>Copy your TradingView session cookies to connect (bypasses CAPTCHA):</p>
           <ol>
             <li>
-              <strong>Log in to TradingView</strong> in your browser
+              <strong>Log in to TradingView</strong> in your browser at{' '}
+              <a href="https://www.tradingview.com" target="_blank" rel="noopener noreferrer">
+                tradingview.com
+              </a>
             </li>
             <li>
               Open <strong>Developer Tools</strong> (F12 or Cmd+Option+I)
@@ -203,28 +268,92 @@ function ConnectPage() {
           />
         </div>
 
-        {error && <div className="error-message">{error}</div>}
+        <button
+          className="btn btn-primary btn-large"
+          onClick={handleConnect}
+          disabled={isConnecting || !sessionId.trim() || !signature.trim()}
+          style={{ width: '100%', marginTop: '1rem' }}
+        >
+          {isConnecting ? 'Connecting...' : 'Connect with Cookies'}
+        </button>
 
-        <div className="button-group">
+        <div className="security-note" style={{ marginTop: '1rem' }}>
+          <strong>Security:</strong> Your session cookies are encrypted and stored securely per-user.
+          They are never shared between users and expire after 7 days.
+        </div>
+      </div>
+
+      {/* Admin auto-login option - only shown if server credentials are configured */}
+      {autoLoginAvailable && (
+        <div className="card">
+          <div className="card-header">
+            <h2>Admin Quick Connect</h2>
+          </div>
+
+          <p>Auto-login using server-configured credentials (uses cached session if available).</p>
+
+          {error && !showManualEntry && <div className="error-message" style={{ marginBottom: '1rem' }}>{error}</div>}
+
           <button
             className="btn btn-secondary"
-            onClick={() => navigate({ to: '/' })}
+            onClick={handleAutoLogin}
+            disabled={isAutoLogging}
+            style={{ width: '100%', marginTop: '1rem' }}
           >
-            Cancel
+            {isAutoLogging ? 'Connecting...' : 'Connect with Server Credentials'}
           </button>
-          <button
-            className="btn btn-primary"
-            onClick={handleConnect}
-            disabled={isConnecting || !sessionId.trim() || !signature.trim()}
-          >
-            {isConnecting ? 'Connecting...' : 'Connect Account'}
-          </button>
+        </div>
+      )}
+
+      {/* User credential login - alternative option (may trigger CAPTCHA) */}
+      <div className="card">
+        <div className="card-header">
+          <h2>Login with Credentials</h2>
+          <span className="badge" style={{ background: 'var(--text-secondary)', color: 'white' }}>Alternative</span>
         </div>
 
-        <div className="security-note">
-          <strong>Security Note:</strong> Your credentials are encrypted and stored securely.
-          We never see your TradingView password. You can disconnect at any time.
+        <p style={{ color: 'var(--text-secondary)', marginBottom: '1rem' }}>
+          <strong>Note:</strong> This method may trigger CAPTCHA verification.
+          Use "Connect with Cookies" above for reliable access.
+        </p>
+
+        <div className="form-group">
+          <label htmlFor="tvUsername">TradingView Username or Email</label>
+          <input
+            id="tvUsername"
+            type="text"
+            className="input"
+            value={tvUsername}
+            onChange={(e) => setTvUsername(e.target.value)}
+            placeholder="Enter your TradingView username or email"
+            disabled={isUserLogging}
+          />
         </div>
+
+        <div className="form-group">
+          <label htmlFor="tvPassword">Password</label>
+          <input
+            id="tvPassword"
+            type="password"
+            className="input"
+            value={tvPassword}
+            onChange={(e) => setTvPassword(e.target.value)}
+            placeholder="Enter your TradingView password"
+            disabled={isUserLogging}
+            onKeyDown={(e) => e.key === 'Enter' && handleUserLogin()}
+          />
+        </div>
+
+        {error && !showManualEntry && <div className="error-message">{error}</div>}
+
+        <button
+          className="btn btn-secondary"
+          onClick={handleUserLogin}
+          disabled={isUserLogging || !tvUsername.trim() || !tvPassword.trim()}
+          style={{ width: '100%', marginTop: '1rem' }}
+        >
+          {isUserLogging ? 'Connecting...' : 'Try Login'}
+        </button>
       </div>
     </div>
   )

@@ -4,6 +4,7 @@ A web app that wraps TradingView's Pine Script editor functionality. Validate, c
 
 ## Features
 
+- **Quick Connect**: Login with your TradingView credentials - no need to copy cookies manually
 - **Quick Syntax Check**: Instant local validation without external services
 - **Script Validation**: Full validation against TradingView's compiler via browser automation
 - **AI Corrections**: Intelligent suggestions to fix script errors (powered by Claude via OpenRouter)
@@ -31,16 +32,16 @@ indicator("Test")
 plot(close    // ← Unclosed parenthesis
 ```
 
-This is different from the full **Validate & Publish** flow, which uses TradingView's actual compiler via Browserless.io and provides AI-powered correction suggestions via OpenRouter.
+This is different from the full **Validate & Publish** flow, which uses TradingView's actual compiler via headless browser automation and provides AI-powered correction suggestions via OpenRouter.
 
 ## Tech Stack
 
 - **Framework**: [TanStack Start](https://tanstack.com/start) (full-stack React with SSR)
-- **Browser Automation**: [Browserless.io](https://browserless.io) + Puppeteer
+- **Browser Automation**: Puppeteer with Chromium (self-hosted on Fly.io)
 - **Payments**: [Stripe](https://stripe.com) Checkout
 - **AI**: [Vercel AI SDK](https://ai-sdk.dev) with [OpenRouter](https://openrouter.ai) (access to Claude, GPT-4, etc.)
-- **State/Sessions**: In-memory store (dev) / [Vercel KV](https://vercel.com/storage/kv) (prod)
-- **Hosting**: [Vercel](https://vercel.com)
+- **State/Sessions**: In-memory store (dev) / Redis (prod)
+- **Hosting**: [Fly.io](https://fly.io)
 
 ## Getting Started
 
@@ -78,11 +79,14 @@ For local development, most features work without external services:
 |----------|----------|-------------|
 | `OPENROUTER_API_KEY` | For AI corrections | OpenRouter API key |
 | `OPENROUTER_MODEL` | Optional | Model to use (default: `anthropic/claude-sonnet-4`) |
-| `BROWSERLESS_API_KEY` | For validation | Browserless.io API key |
+| `BROWSERLESS_API_KEY` | Optional | Browserless.io API key (not needed on Fly.io, uses self-hosted Chromium) |
 | `STRIPE_SECRET_KEY` | For payments | Stripe secret key |
 | `STRIPE_WEBHOOK_SECRET` | For payments | Stripe webhook signing secret |
-| `KV_REST_API_URL` | Optional | Vercel KV URL (uses in-memory store if not set) |
-| `KV_REST_API_TOKEN` | Optional | Vercel KV token |
+| `REDIS_URL` | Optional | Redis connection URL (uses in-memory store if not set) |
+| `SESSION_SECRET` | Production | Secret key for session encryption |
+| `TV_CREDENTIAL_ENCRYPTION_KEY` | Production | Encryption key for TradingView credentials |
+| `TV_USERNAME` | Optional | TradingView username for auto-login feature |
+| `TV_PASSWORD` | Optional | TradingView password for auto-login feature |
 
 ## Project Structure
 
@@ -112,7 +116,7 @@ pine-script-wrapper/
 
 1. **Paste Script**: User pastes Pine Script on home page
 2. **Quick Check**: Optional local syntax validation
-3. **Connect TradingView**: User provides session cookies for their TV account
+3. **Connect TradingView**: User enters TradingView credentials (Quick Connect) or pastes cookies manually
 4. **Validate**: Script is tested in TradingView's editor via browser automation
 5. **AI Corrections**: If errors found, AI suggests fixes
 6. **Payment**: Stripe checkout for publishing fee
@@ -130,19 +134,57 @@ npm run test     # Run tests
 
 ## Deployment
 
-### Vercel (Recommended)
+### Fly.io (Current)
+
+The application is deployed on Fly.io with built-in Puppeteer/Chromium support for TradingView automation.
+
+**Prerequisites:**
+- Install [flyctl](https://fly.io/docs/flyctl/install/)
+- Authenticate with `flyctl auth login`
+
+**Deploy:**
+
+```bash
+# Deploy to Fly.io (builds and deploys in one command)
+flyctl deploy
+
+# Check deployment status
+flyctl status
+
+# View logs
+flyctl logs
+
+# Open the deployed app
+flyctl open
+```
+
+**Set Environment Secrets:**
+
+```bash
+# Required secrets
+flyctl secrets set OPENROUTER_API_KEY=your_key
+flyctl secrets set SESSION_SECRET=your_secret
+flyctl secrets set TV_CREDENTIAL_ENCRYPTION_KEY=your_key
+
+# Optional secrets
+flyctl secrets set REDIS_URL=your_redis_url
+flyctl secrets set STRIPE_SECRET_KEY=your_stripe_key
+flyctl secrets set STRIPE_WEBHOOK_SECRET=your_webhook_secret
+```
+
+The app configuration is in `fly.toml`. Key settings:
+- Auto-stop/start machines for cost optimization
+- 512MB memory, 1 CPU (required for headless Chrome)
+- San Jose (sjc) region
+
+### Vercel (Alternative)
 
 1. Push to GitHub
 2. Import project in Vercel
 3. Add environment variables in Vercel dashboard
 4. Deploy
 
-### Manual
-
-```bash
-npm run build
-# Deploy .output directory to your hosting provider
-```
+Note: Vercel deployment may have limitations with Puppeteer. Fly.io is recommended for full functionality.
 
 ## Configuration
 
@@ -153,17 +195,27 @@ npm run build
 3. Set up webhook endpoint: `https://your-domain.com/api/stripe/webhook`
 4. Add keys to `.env`
 
-### Browserless Setup
+### Browserless Setup (Optional - for development)
 
 1. Create account at browserless.io
 2. Get API key from dashboard
 3. Add to `.env` as `BROWSERLESS_API_KEY`
 
-### Vercel KV Setup (Production)
+Note: In production on Fly.io, the app uses self-hosted Chromium via Puppeteer (configured in Dockerfile).
 
-1. In Vercel dashboard: Storage → Create Database → KV
-2. Link to your project
-3. Environment variables are automatically added
+### Redis Setup (Production)
+
+For production deployments on Fly.io:
+
+```bash
+# Create a Redis instance on Fly.io
+flyctl redis create
+
+# Set the Redis URL secret
+flyctl secrets set REDIS_URL=redis://your-redis-instance.flycast:6379
+```
+
+Alternatively, you can use any Redis provider (Upstash, Redis Cloud, etc.) and set the `REDIS_URL` secret accordingly.
 
 ## License
 
