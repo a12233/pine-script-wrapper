@@ -11,6 +11,8 @@ primary_region = 'sjc'
 [env]
   NODE_ENV = 'production'
   PORT = '3000'
+  # Phase B: Use /pine/ endpoint for faster validation/publishing
+  TV_USE_PINE_PAGE = 'true'
 
 [http_service]
   internal_port = 3000
@@ -21,5 +23,5 @@ primary_region = 'sjc'
   processes = ['app']
 
 [[vm]]
-  memory = '512mb'
+  memory = '1024mb'
   cpus = 1

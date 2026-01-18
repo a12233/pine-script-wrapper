@@ -16,6 +16,9 @@ const config = defineConfig({
     devtools(),
     nitro({
       preset: 'node-server',
+      rollupConfig: {
+        external: ['ws', 'bufferutil', 'utf-8-validate'],
+      },
     }),
     // this is the plugin that enables path aliases
     viteTsConfigPaths({
