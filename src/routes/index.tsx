@@ -1,21 +1,7 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { createServerFn } from '@tanstack/react-start'
 import { quickSyntaxCheck } from '../server/ai'
-import { getUserSession } from '../server/kv'
-
-// Server function to check if user has TV connected
-const checkUserStatus = createServerFn()
-  .handler(async (ctx: { data: { userId: string | null } }) => {
-    if (!ctx.data.userId) {
-      return { tvConnected: false }
-    }
-
-    const session = await getUserSession(ctx.data.userId)
-    return {
-      tvConnected: session?.tvConnected ?? false,
-    }
-  })
 
 // Server function for quick syntax validation
 const validateSyntax = createServerFn()
@@ -52,18 +38,6 @@ function Home() {
   const [script, setScript] = useState(DEFAULT_SCRIPT)
   const [syntaxIssues, setSyntaxIssues] = useState<string[]>([])
   const [isValidating, setIsValidating] = useState(false)
-  const [tvConnected, setTvConnected] = useState(false)
-
-  useEffect(() => {
-    const checkConnection = async () => {
-      const userId = localStorage.getItem('userId')
-      if (userId) {
-        const result = await checkUserStatus({ data: { userId } })
-        setTvConnected(result.tvConnected)
-      }
-    }
-    checkConnection()
-  }, [])
 
   const handleQuickCheck = async () => {
     if (!script.trim()) return
@@ -79,10 +53,6 @@ function Home() {
   }
 
   const handleValidate = () => {
-    if (!tvConnected) {
-      navigate({ to: '/connect' })
-      return
-    }
     // Store script in session storage for the validate page
     sessionStorage.setItem('pendingScript', script)
     navigate({ to: '/validate' })
@@ -98,12 +68,6 @@ function Home() {
       <div className="card">
         <div className="card-header">
           <h2>Paste Your Pine Script</h2>
-          {!tvConnected && (
-            <span className="badge badge-warning">TradingView not connected</span>
-          )}
-          {tvConnected && (
-            <span className="badge badge-success">TradingView connected</span>
-          )}
         </div>
 
         <textarea
@@ -143,7 +107,7 @@ plot(close)`}
             onClick={handleValidate}
             disabled={!script.trim()}
           >
-            {tvConnected ? 'Validate & Publish' : 'Connect TradingView to Publish'}
+            Validate & Publish
           </button>
         </div>
       </div>
@@ -154,12 +118,12 @@ plot(close)`}
           <p>Check your script against TradingView's compiler</p>
         </div>
         <div className="feature">
-          <h3>AI Corrections</h3>
-          <p>Get intelligent suggestions to fix errors</p>
+          <h3>Auto-Fix</h3>
+          <p>AI automatically corrects common errors</p>
         </div>
         <div className="feature">
           <h3>Publish</h3>
-          <p>Publish as a private indicator with one click</p>
+          <p>Publish as an indicator with one click</p>
         </div>
       </div>
     </div>

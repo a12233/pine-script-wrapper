@@ -11,7 +11,6 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as ValidateRouteImport } from './routes/validate'
 import { Route as SuccessRouteImport } from './routes/success'
-import { Route as ConnectRouteImport } from './routes/connect'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiStripeWebhookRouteImport } from './routes/api/stripe/webhook'
 
@@ -23,11 +22,6 @@ const ValidateRoute = ValidateRouteImport.update({
 const SuccessRoute = SuccessRouteImport.update({
   id: '/success',
   path: '/success',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const ConnectRoute = ConnectRouteImport.update({
-  id: '/connect',
-  path: '/connect',
   getParentRoute: () => rootRouteImport,
 } as any)
 const IndexRoute = IndexRouteImport.update({
@@ -43,14 +37,12 @@ const ApiStripeWebhookRoute = ApiStripeWebhookRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
-  '/connect': typeof ConnectRoute
   '/success': typeof SuccessRoute
   '/validate': typeof ValidateRoute
   '/api/stripe/webhook': typeof ApiStripeWebhookRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
-  '/connect': typeof ConnectRoute
   '/success': typeof SuccessRoute
   '/validate': typeof ValidateRoute
   '/api/stripe/webhook': typeof ApiStripeWebhookRoute
@@ -58,28 +50,20 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
-  '/connect': typeof ConnectRoute
   '/success': typeof SuccessRoute
   '/validate': typeof ValidateRoute
   '/api/stripe/webhook': typeof ApiStripeWebhookRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/connect' | '/success' | '/validate' | '/api/stripe/webhook'
+  fullPaths: '/' | '/success' | '/validate' | '/api/stripe/webhook'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/connect' | '/success' | '/validate' | '/api/stripe/webhook'
-  id:
-    | '__root__'
-    | '/'
-    | '/connect'
-    | '/success'
-    | '/validate'
-    | '/api/stripe/webhook'
+  to: '/' | '/success' | '/validate' | '/api/stripe/webhook'
+  id: '__root__' | '/' | '/success' | '/validate' | '/api/stripe/webhook'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
-  ConnectRoute: typeof ConnectRoute
   SuccessRoute: typeof SuccessRoute
   ValidateRoute: typeof ValidateRoute
   ApiStripeWebhookRoute: typeof ApiStripeWebhookRoute
@@ -101,13 +85,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SuccessRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/connect': {
-      id: '/connect'
-      path: '/connect'
-      fullPath: '/connect'
-      preLoaderRoute: typeof ConnectRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/': {
       id: '/'
       path: '/'
@@ -127,7 +104,6 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
-  ConnectRoute: ConnectRoute,
   SuccessRoute: SuccessRoute,
   ValidateRoute: ValidateRoute,
   ApiStripeWebhookRoute: ApiStripeWebhookRoute,
