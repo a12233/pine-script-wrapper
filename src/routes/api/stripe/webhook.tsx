@@ -1,8 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { verifyWebhookEvent } from '../../../server/stripe'
 import { getJobByStripeSession, updatePublishJob } from '../../../server/kv'
-import { publishPineScript } from '../../../server/tradingview'
-import { getServiceAccountCredentials } from '../../../server/service-validation'
 
 export const Route = createFileRoute('/api/stripe/webhook')({
   server: {
@@ -40,46 +38,13 @@ export const Route = createFileRoute('/api/stripe/webhook')({
               if (job) {
                 console.log(`[Webhook] Found job ${job.jobId} for session ${session.id}`)
 
-                // Update job status to processing
-                await updatePublishJob(job.jobId, { status: 'processing' })
-
-                // Get service account credentials (no user credentials needed)
-                const credentials = await getServiceAccountCredentials()
-
-                if (credentials) {
-                  try {
-                    // Publish the script to TradingView using service account
-                    const result = await publishPineScript(credentials, {
-                      script: job.script,
-                      title: job.title,
-                      description: job.description,
-                      visibility: job.visibility,
-                    })
-
-                    // Update job with success
-                    await updatePublishJob(job.jobId, {
-                      status: 'completed',
-                      indicatorUrl: result.indicatorUrl,
-                    })
-
-                    console.log(`[Webhook] Published indicator: ${result.indicatorUrl}`)
-                  } catch (publishError) {
-                    // Update job with failure
-                    const errorMessage = publishError instanceof Error ? publishError.message : 'Publishing failed'
-                    await updatePublishJob(job.jobId, {
-                      status: 'failed',
-                      error: errorMessage,
-                    })
-
-                    console.error(`[Webhook] Publishing failed:`, publishError)
-                  }
+                // Just mark as completed - URL is already stored from validation+publish step
+                // NO BROWSER AUTOMATION NEEDED
+                if (job.status === 'pending') {
+                  await updatePublishJob(job.jobId, { status: 'completed' })
+                  console.log(`[Webhook] Job ${job.jobId} marked complete, URL: ${job.indicatorUrl}`)
                 } else {
-                  await updatePublishJob(job.jobId, {
-                    status: 'failed',
-                    error: 'Service account authentication failed',
-                  })
-
-                  console.error(`[Webhook] Service account credentials not available`)
+                  console.log(`[Webhook] Job ${job.jobId} already ${job.status}, skipping update`)
                 }
               } else {
                 console.warn(`[Webhook] No job found for session ${session.id}`)

@@ -17,7 +17,6 @@ interface AdminCachedSession {
   sessionId: string
   signature: string
   createdAt: number
-  expiresAt: number
 }
 
 let adminSessionCache: AdminCachedSession | null = null
@@ -25,31 +24,26 @@ let adminSessionCache: AdminCachedSession | null = null
 /**
  * Load admin cached session from memory
  * Only used for server-level auto-login, not for user sessions
+ * No expiry - sessions persist until cleared or auth fails
  */
 function loadAdminCachedSession(): AdminCachedSession | null {
   if (!adminSessionCache) return null
 
-  // Check if session is expired (with 1 hour buffer)
-  if (Date.now() > adminSessionCache.expiresAt - 60 * 60 * 1000) {
-    console.log('[TV Admin Cache] Cached session expired, clearing...')
-    adminSessionCache = null
-    return null
-  }
-
-  console.log(`[TV Admin Cache] Using cached admin session (expires: ${new Date(adminSessionCache.expiresAt).toISOString()})`)
+  console.log('[TV Admin Cache] Using cached admin session (no expiry)')
   return adminSessionCache
 }
 
 /**
  * Save admin session to in-memory cache
  * Only used for server-level auto-login with environment credentials
+ * No expiry - sessions persist until cleared or auth fails
  */
-function saveAdminCachedSession(session: Omit<AdminCachedSession, 'createdAt'>): void {
+function saveAdminCachedSession(session: { sessionId: string; signature: string }): void {
   adminSessionCache = {
     ...session,
     createdAt: Date.now(),
   }
-  console.log(`[TV Admin Cache] Admin session cached in memory (expires: ${new Date(session.expiresAt).toISOString()})`)
+  console.log('[TV Admin Cache] Admin session cached in memory (no expiry)')
 }
 
 /**
@@ -188,42 +182,47 @@ const DEV_BYPASS = process.env.NODE_ENV === 'development' && process.env.TV_DEV_
 /**
  * Login to TradingView using server-configured credentials (TV_USERNAME/TV_PASSWORD)
  * First checks for a valid cached admin session to avoid CAPTCHA
+ * If CAPTCHA is detected, automatically falls back to visible browser for manual solving
  * Note: This is for admin/server-level login only. User sessions are handled separately via kv.ts.
+ * @param isVisibleRetry - Internal: true if this is a retry with visible browser for CAPTCHA
  */
-export async function loginWithCredentials(): Promise<TVCredentials | null> {
+export async function loginWithCredentials(isVisibleRetry: boolean = false): Promise<TVCredentials | null> {
   if (!TV_USERNAME || !TV_PASSWORD) {
     console.log('[TV] No username/password configured in environment')
     return null
   }
 
-  // First, check for cached admin session
-  const cached = loadAdminCachedSession()
-  if (cached) {
-    console.log('[TV] Found cached admin session, verifying...')
-    const isValid = await verifyTVSession({
-      sessionId: cached.sessionId,
-      signature: cached.signature,
-      userId: 'admin',
-    })
-
-    if (isValid) {
-      console.log('[TV] Cached admin session is valid, reusing...')
-      return {
+  // First, check for cached admin session (skip on visible retry since we need fresh login)
+  if (!isVisibleRetry) {
+    const cached = loadAdminCachedSession()
+    if (cached) {
+      console.log('[TV] Found cached admin session, verifying...')
+      const isValid = await verifyTVSession({
         sessionId: cached.sessionId,
         signature: cached.signature,
         userId: 'admin',
+      })
+
+      if (isValid) {
+        console.log('[TV] Cached admin session is valid, reusing...')
+        return {
+          sessionId: cached.sessionId,
+          signature: cached.signature,
+          userId: 'admin',
+        }
+      } else {
+        console.log('[TV] Cached admin session is invalid, clearing...')
+        clearAdminCachedSession()
       }
-    } else {
-      console.log('[TV] Cached admin session is invalid, clearing...')
-      clearAdminCachedSession()
     }
   }
 
   let session: BrowserlessSession | null = null
 
   try {
-    console.log('[TV] Attempting auto-login with environment credentials (note: may fail due to CAPTCHA)')
-    session = await createBrowserSession()
+    const mode = isVisibleRetry ? 'visible (for CAPTCHA)' : 'standard'
+    console.log(`[TV] Attempting auto-login with environment credentials (${mode})`)
+    session = await createBrowserSession({ forceVisible: isVisibleRetry })
     const { page } = session
 
     // Navigate to TradingView login page
@@ -422,6 +421,15 @@ export async function loginWithCredentials(): Promise<TVCredentials | null> {
     })
 
     if (hasCaptcha) {
+      if (!isVisibleRetry) {
+        // First attempt: retry with visible browser for manual CAPTCHA solving
+        console.log('[TV] CAPTCHA detected - retrying with visible browser for manual solving...')
+        await closeBrowserSession(session)
+        session = null
+        return loginWithCredentials(true)
+      }
+
+      // Already in visible mode - wait for user to solve CAPTCHA
       console.log('[TV] 🤖 CAPTCHA detected! Please solve it in the browser window...')
       console.log('[TV] Waiting up to 60 seconds for CAPTCHA to be solved...')
 
@@ -513,11 +521,10 @@ export async function loginWithCredentials(): Promise<TVCredentials | null> {
 
     console.log('[TV] Auto-login successful, cookies extracted')
 
-    // Cache the admin session in memory for future use (7 days)
+    // Cache the admin session in memory for future use (no expiry)
     saveAdminCachedSession({
       sessionId: sessionIdCookie.value,
       signature: signatureCookie.value,
-      expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
     })
 
     return {
@@ -547,11 +554,15 @@ export interface UserLoginResult {
 
 /**
  * Login to TradingView using user-provided credentials (for hosted users)
- * This runs headless and cannot handle CAPTCHA - returns error if detected
+ * If CAPTCHA is detected, automatically falls back to visible browser for manual solving
+ * @param username - TradingView username/email
+ * @param password - TradingView password
+ * @param isVisibleRetry - Internal: true if this is a retry with visible browser for CAPTCHA
  */
 export async function loginWithUserCredentials(
   username: string,
-  password: string
+  password: string,
+  isVisibleRetry: boolean = false
 ): Promise<UserLoginResult> {
   if (!username || !password) {
     return { success: false, error: 'Username and password are required' }
@@ -560,8 +571,9 @@ export async function loginWithUserCredentials(
   let session: BrowserlessSession | null = null
 
   try {
-    console.log('[TV] Attempting login with user-provided credentials')
-    session = await createBrowserSession()
+    const mode = isVisibleRetry ? 'visible (for CAPTCHA)' : 'standard'
+    console.log(`[TV] Attempting login with user-provided credentials (${mode})`)
+    session = await createBrowserSession({ forceVisible: isVisibleRetry })
     const { page } = session
 
     // Navigate to TradingView login page
@@ -690,12 +702,55 @@ export async function loginWithUserCredentials(
     })
 
     if (hasCaptcha) {
-      console.log('[TV] CAPTCHA detected - cannot solve in headless mode')
-      return {
-        success: false,
-        error: 'CAPTCHA verification required. Please use manual cookie method instead.',
-        captchaDetected: true,
+      if (!isVisibleRetry) {
+        // First attempt: retry with visible browser for manual CAPTCHA solving
+        console.log('[TV] CAPTCHA detected - retrying with visible browser for manual solving...')
+        await closeBrowserSession(session)
+        session = null
+        return loginWithUserCredentials(username, password, true)
       }
+
+      // Already in visible mode - wait for user to solve CAPTCHA
+      console.log('[TV] 🤖 CAPTCHA detected! Please solve it in the browser window...')
+      console.log('[TV] Waiting up to 60 seconds for CAPTCHA to be solved...')
+
+      let captchaSolved = false
+      for (let i = 0; i < 30; i++) {
+        await delay(2000)
+
+        // Check if we've been redirected away from signin page
+        const currentUrlCheck = page.url()
+        if (!currentUrlCheck.includes('signin')) {
+          console.log('[TV] ✅ CAPTCHA appears to be solved (redirected)')
+          captchaSolved = true
+          break
+        }
+
+        // Check if CAPTCHA disappeared
+        const stillHasCaptcha = await page.evaluate(() => {
+          const recaptchaFrame = document.querySelector('iframe[src*="recaptcha"]')
+          return !!recaptchaFrame
+        })
+
+        if (!stillHasCaptcha) {
+          console.log('[TV] ✅ CAPTCHA appears to be solved')
+          captchaSolved = true
+          break
+        }
+      }
+
+      if (!captchaSolved) {
+        console.error('[TV] CAPTCHA was not solved in time')
+        await page.screenshot({ path: '/tmp/tv-login-captcha-timeout.png' })
+        return {
+          success: false,
+          error: 'CAPTCHA was not solved within 60 seconds',
+          captchaDetected: true,
+        }
+      }
+
+      // Wait for login to process after CAPTCHA
+      await delay(3000)
     }
 
     // Wait for login to complete

@@ -1,9 +1,9 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useState, useEffect, useRef } from 'react'
 import { createServerFn } from '@tanstack/react-start'
-import { runValidationLoop, type ValidationLoopResult } from '../server/validation-loop'
+import { runValidationLoop, type ValidationLoopResult, type PublishAfterValidationOptions } from '../server/validation-loop'
 import { hashScript, createPublishJob, generateUserId } from '../server/kv'
-import { createCheckoutSession } from '../server/stripe'
+import { createCheckoutSession, getProductDetails, type ProductDetails } from '../server/stripe'
 
 interface ValidationState {
   script: string
@@ -13,16 +13,30 @@ interface ValidationState {
   error?: string
 }
 
-// Server function to validate script using service account with auto-fix
-const validateScript = createServerFn()
-  .handler(async (ctx: { data: { script: string } }) => {
-    return runValidationLoop(ctx.data.script, 1) // 1 retry max
+interface PublishFormData {
+  title: string
+  description: string
+  visibility: 'public' | 'private'
+}
+
+// Server function to validate script AND publish in one step
+// This combines validation + publish for better performance (single browser session)
+const validateAndPublishScript = createServerFn()
+  .handler(async (ctx: { data: { script: string; publishOptions: PublishAfterValidationOptions } }) => {
+    return runValidationLoop(ctx.data.script, 1, ctx.data.publishOptions)
+  })
+
+// Server function to fetch product details from Stripe
+const fetchProductDetails = createServerFn()
+  .handler(async () => {
+    return getProductDetails()
   })
 
 // Server function to create checkout session
+// Note: Script is already published at this point, we just store the indicatorUrl
 const createCheckout = createServerFn()
-  .handler(async (ctx: { data: { script: string; originalScript: string; fixApplied: boolean; title: string; description: string; visibility: 'public' | 'private' } }) => {
-    const { script, originalScript, fixApplied, title, description, visibility } = ctx.data
+  .handler(async (ctx: { data: { script: string; originalScript: string; fixApplied: boolean; title: string; description: string; visibility: 'public' | 'private'; indicatorUrl?: string } }) => {
+    const { script, originalScript, fixApplied, title, description, visibility, indicatorUrl } = ctx.data
     const scriptHash = hashScript(script)
 
     // Generate a userId for this transaction (no login required)
@@ -34,7 +48,7 @@ const createCheckout = createServerFn()
       userId,
     })
 
-    // Create pending job (store original script if AI fix was applied)
+    // Create pending job with indicatorUrl already populated (script was published during validation)
     await createPublishJob({
       userId,
       scriptHash,
@@ -45,6 +59,7 @@ const createCheckout = createServerFn()
       description,
       visibility,
       stripeSessionId: checkout.sessionId,
+      indicatorUrl, // URL from validation+publish step
     })
 
     return { checkoutUrl: checkout.url }
@@ -65,33 +80,52 @@ function ValidatePage() {
   const [description, setDescription] = useState('')
   const [visibility, setVisibility] = useState<'public' | 'private'>('public')
   const [isCreatingCheckout, setIsCreatingCheckout] = useState(false)
+  const [productDetails, setProductDetails] = useState<ProductDetails | null>(null)
 
-  // Load script from session storage on mount
-  // Use ref to prevent double validation in React StrictMode
-  const validationStartedRef = useRef(false)
+  // Track if we've loaded the script from session storage
+  const scriptLoadedRef = useRef(false)
 
+  // Load script from session storage on mount (but don't auto-validate anymore)
   useEffect(() => {
-    // Prevent double validation from React StrictMode
-    if (validationStartedRef.current) {
+    if (scriptLoadedRef.current) {
       return
     }
 
     const pendingScript = sessionStorage.getItem('pendingScript')
     if (pendingScript) {
-      validationStartedRef.current = true
+      scriptLoadedRef.current = true
       setState((s) => ({ ...s, script: pendingScript, originalScript: pendingScript }))
-      // Start validation
-      runValidation(pendingScript)
+      // Don't auto-validate - wait for user to fill in title first
     } else {
       navigate({ to: '/' })
     }
   }, [navigate])
 
-  const runValidation = async (script: string) => {
+  // Fetch product details from Stripe on mount
+  useEffect(() => {
+    fetchProductDetails().then(setProductDetails).catch(console.error)
+  }, [])
+
+  // Validate AND publish in one step (after user fills in title)
+  const runValidationAndPublish = async () => {
+    if (!title.trim()) {
+      alert('Please enter a title for your indicator')
+      return
+    }
+
     setState((s) => ({ ...s, status: 'validating' }))
 
     try {
-      const result = await validateScript({ data: { script } })
+      const result = await validateAndPublishScript({
+        data: {
+          script: state.script,
+          publishOptions: {
+            title: title.trim(),
+            description: description.trim(),
+            visibility,
+          },
+        },
+      })
 
       setState((s) => ({
         ...s,
@@ -109,8 +143,8 @@ function ValidatePage() {
   }
 
   const handleProceedToPayment = async () => {
-    if (!title.trim()) {
-      alert('Please enter a title for your indicator')
+    if (!state.result?.indicatorUrl) {
+      alert('Script must be validated and published first')
       return
     }
 
@@ -125,6 +159,7 @@ function ValidatePage() {
           title: title.trim(),
           description: description.trim(),
           visibility,
+          indicatorUrl: state.result.indicatorUrl, // Include URL from validation+publish
         },
       })
 
@@ -139,33 +174,31 @@ function ValidatePage() {
   }
 
   const handleRetryValidation = () => {
-    validationStartedRef.current = false
     setState((s) => ({
       ...s,
       status: 'idle',
       result: undefined,
       error: undefined,
     }))
-    runValidation(state.script)
   }
 
   return (
     <div className="container">
       <div className="hero">
-        <h1>Script Validation</h1>
-        <p>Validating your Pine Script with TradingView</p>
+        <h1>Publish Your Script</h1>
+        <p>Enter your indicator details and validate with TradingView</p>
       </div>
 
       {/* Status indicator */}
       <div className="status-bar">
-        <div className={`status-step ${state.status !== 'idle' ? 'active' : ''}`}>
-          1. Validating
+        <div className={`status-step ${state.status === 'idle' ? 'active' : ''}`}>
+          1. Enter Details
         </div>
-        <div className={`status-step ${state.result?.fixAttempted ? 'active' : ''}`}>
-          2. Auto-Fix {state.result?.fixAttempted ? (state.result.fixSuccessful ? '(Applied)' : '(Attempted)') : ''}
+        <div className={`status-step ${state.status === 'validating' ? 'active' : ''}`}>
+          2. Validating & Publishing
         </div>
-        <div className={`status-step ${state.status === 'done' ? 'active' : ''}`}>
-          3. Ready
+        <div className={`status-step ${state.status === 'done' && state.result?.isValid ? 'active' : ''}`}>
+          3. Ready for Payment
         </div>
       </div>
 
@@ -189,8 +222,83 @@ function ValidatePage() {
       {state.status === 'validating' && (
         <div className="card loading-card">
           <div className="spinner" />
-          <p>Validating with TradingView...</p>
-          <small>This may take a few seconds</small>
+          <h2>Validating & Publishing...</h2>
+          <p>Your script is being validated and published to TradingView.</p>
+          <small>This may take up to a minute</small>
+        </div>
+      )}
+
+      {/* Form state - show BEFORE validation */}
+      {state.status === 'idle' && (
+        <div className="card">
+          <div className="card-header">
+            <h2>{productDetails?.productName ?? 'Indicator Details'}</h2>
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="title">Indicator Title *</label>
+            <input
+              id="title"
+              type="text"
+              className="input"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="My Custom Indicator"
+            />
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="description">Description (optional)</label>
+            <textarea
+              id="description"
+              className="input"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="Describe what your indicator does..."
+              rows={3}
+            />
+          </div>
+
+          <div className="form-group">
+            <label>Visibility</label>
+            <div className="visibility-options">
+              <label className="radio-label">
+                <input
+                  type="radio"
+                  name="visibility"
+                  value="public"
+                  checked={visibility === 'public'}
+                  onChange={() => setVisibility('public')}
+                />
+                <span>Public</span>
+                <small>Anyone can view and use your indicator</small>
+              </label>
+              <label className="radio-label">
+                <input
+                  type="radio"
+                  name="visibility"
+                  value="private"
+                  checked={visibility === 'private'}
+                  onChange={() => setVisibility('private')}
+                />
+                <span>Private</span>
+                <small>Only you can see and use this indicator</small>
+              </label>
+            </div>
+          </div>
+
+          <div className="price-info">
+            <span className="price">{productDetails?.priceFormatted ?? '...'}</span>
+            <span className="price-desc">One-time payment to publish</span>
+          </div>
+
+          <button
+            className="btn btn-primary btn-large"
+            onClick={runValidationAndPublish}
+            disabled={!title.trim()}
+          >
+            {title.trim() ? 'Validate & Publish' : 'Enter title to continue'}
+          </button>
         </div>
       )}
 
@@ -200,12 +308,12 @@ function ValidatePage() {
           {/* Validation Result */}
           <div className={`card ${state.result.isValid ? 'success-card' : 'warning-card'}`}>
             <div className="card-header">
-              <h2>{state.result.isValid ? 'Script Valid!' : 'Validation Failed'}</h2>
+              <h2>{state.result.isValid ? 'Script Published!' : 'Validation Failed'}</h2>
               <span
                 className={`badge ${state.result.isValid ? 'badge-success' : 'badge-warning'}`}
               >
                 {state.result.isValid
-                  ? 'Ready to publish'
+                  ? 'Ready for payment'
                   : `${state.result.finalErrors.length} error(s)`}
               </span>
             </div>
@@ -215,13 +323,22 @@ function ValidatePage() {
               <div className="fix-info">
                 {state.result.fixSuccessful ? (
                   <p className="fix-success">
-                    AI automatically fixed errors in your script. The corrected version will be available after payment.
+                    AI automatically fixed errors in your script. The corrected version has been published.
                   </p>
                 ) : (
                   <p className="fix-failed">
                     AI attempted to fix errors but some issues remain. Please review and fix manually.
                   </p>
                 )}
+              </div>
+            )}
+
+            {/* Show publish error if any */}
+            {state.result.isValid && state.result.publishError && (
+              <div className="fix-info">
+                <p className="fix-failed">
+                  Warning: Publishing encountered an issue: {state.result.publishError}
+                </p>
               </div>
             )}
 
@@ -238,80 +355,38 @@ function ValidatePage() {
             )}
           </div>
 
-          {/* Publish Form - only show if valid */}
-          {state.result.isValid && (
+          {/* Payment button - only show if valid and published */}
+          {state.result.isValid && state.result.indicatorUrl && (
             <div className="card">
               <div className="card-header">
-                <h2>Publish Your Indicator</h2>
+                <h2>Complete Your Purchase</h2>
               </div>
 
-              <div className="form-group">
-                <label htmlFor="title">Indicator Title</label>
-                <input
-                  id="title"
-                  type="text"
-                  className="input"
-                  value={title}
-                  onChange={(e) => setTitle(e.target.value)}
-                  placeholder="My Custom Indicator"
-                />
-              </div>
-
-              <div className="form-group">
-                <label htmlFor="description">Description (optional)</label>
-                <textarea
-                  id="description"
-                  className="input"
-                  value={description}
-                  onChange={(e) => setDescription(e.target.value)}
-                  placeholder="Describe what your indicator does..."
-                  rows={3}
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Visibility</label>
-                <div className="visibility-options">
-                  <label className="radio-label">
-                    <input
-                      type="radio"
-                      name="visibility"
-                      value="public"
-                      checked={visibility === 'public'}
-                      onChange={() => setVisibility('public')}
-                    />
-                    <span>Public</span>
-                    <small>Anyone can view and use your indicator</small>
-                  </label>
-                  <label className="radio-label">
-                    <input
-                      type="radio"
-                      name="visibility"
-                      value="private"
-                      checked={visibility === 'private'}
-                      onChange={() => setVisibility('private')}
-                    />
-                    <span>Private</span>
-                    <small>Only you can see and use this indicator</small>
-                  </label>
-                </div>
-              </div>
+              <p>Your script "{title}" has been validated and published. Complete payment to receive your indicator URL.</p>
 
               <div className="price-info">
-                <span className="price">$9.99</span>
-                <span className="price-desc">One-time payment to publish</span>
+                <span className="price">{productDetails?.priceFormatted ?? '...'}</span>
+                <span className="price-desc">One-time payment</span>
               </div>
 
               <button
                 className="btn btn-primary btn-large"
                 onClick={handleProceedToPayment}
-                disabled={isCreatingCheckout || !title.trim()}
+                disabled={isCreatingCheckout}
               >
                 {isCreatingCheckout ? 'Creating checkout...' : 'Proceed to Payment'}
               </button>
             </div>
           )}
 
+          {/* Retry if validation failed */}
+          {!state.result.isValid && (
+            <div className="button-group">
+              <button className="btn btn-secondary" onClick={handleRetryValidation}>
+                Try Again
+              </button>
+            </div>
+          )}
         </>
       )}
 

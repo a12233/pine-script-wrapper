@@ -1,5 +1,6 @@
-import puppeteer, { Browser, Page } from 'puppeteer-core'
+import puppeteer, { Browser, Page, CDPSession } from 'puppeteer-core'
 import fs from 'fs'
+import crypto from 'crypto'
 
 const BROWSERLESS_API_KEY = process.env.BROWSERLESS_API_KEY
 const BROWSERLESS_ENDPOINT = process.env.BROWSERLESS_ENDPOINT || 'wss://chrome.browserless.io'
@@ -100,18 +101,26 @@ export interface BrowserlessSession {
   page: Page
 }
 
+export interface BrowserSessionOptions {
+  /** Force visible browser window (for CAPTCHA solving) */
+  forceVisible?: boolean
+}
+
 /**
  * Create a browser session
  * - Uses visible Chrome window in dev (USE_LOCAL_BROWSER=true)
  * - Uses headless Chromium in production container (PUPPETEER_EXECUTABLE_PATH set)
  * - Falls back to Browserless.io if neither is available
+ * @param options.forceVisible - Force visible browser for CAPTCHA solving
  */
-export async function createBrowserSession(): Promise<BrowserlessSession> {
+export async function createBrowserSession(options?: BrowserSessionOptions): Promise<BrowserlessSession> {
+  const forceVisible = options?.forceVisible ?? false
   let browser: Browser
 
-  if (USE_LOCAL_BROWSER) {
+  if (USE_LOCAL_BROWSER || forceVisible) {
     // Launch local Chrome
     // Options: HEADLESS_BROWSER=true for invisible, otherwise launches minimized
+    // forceVisible overrides to show visible browser (for CAPTCHA solving)
     const chromePath = getChromePath()
 
     // Use custom profile dir if set, otherwise use a puppeteer-specific profile
@@ -125,14 +134,18 @@ export async function createBrowserSession(): Promise<BrowserlessSession> {
       `--user-data-dir=${userDataDir}`,
     ]
 
-    // Launch minimized/hidden by default (unless headless)
+    // Launch minimized/hidden by default (unless headless or forceVisible)
     // Note: --start-minimized doesn't work on Linux, so we position window off-screen instead
-    if (!HEADLESS_BROWSER) {
+    // forceVisible shows the browser on-screen for manual CAPTCHA solving
+    const shouldHideWindow = !HEADLESS_BROWSER && !forceVisible
+    if (shouldHideWindow) {
       args.push('--window-position=-2400,-2400')
     }
 
-    const headless = HEADLESS_BROWSER ? 'new' : false
-    console.log(`🌐 Launching Chrome: ${chromePath} (headless: ${headless}, off-screen: ${!HEADLESS_BROWSER})`)
+    // forceVisible always uses non-headless mode
+    const headless = forceVisible ? false : (HEADLESS_BROWSER ? 'new' : false)
+    const visibleReason = forceVisible ? 'CAPTCHA solving' : (HEADLESS_BROWSER ? 'headless' : 'off-screen')
+    console.log(`🌐 Launching Chrome: ${chromePath} (mode: ${visibleReason})`)
     console.log(`   Profile: ${userDataDir}`)
 
     browser = await puppeteer.launch({
@@ -260,5 +273,195 @@ export async function navigateTo(
   } catch (error) {
     console.error(`Navigation to ${url} failed:`, error)
     return false
+  }
+}
+
+// ============ Live Session Management (for Admin CAPTCHA solving) ============
+
+export interface LiveSession {
+  sessionId: string
+  liveURL: string
+  browser: Browser
+  page: Page
+  cdpSession: CDPSession
+  createdAt: number
+}
+
+// In-memory storage for active live sessions
+const liveSessions = new Map<string, LiveSession>()
+
+// Clean up old sessions after 10 minutes
+const LIVE_SESSION_TTL = 10 * 60 * 1000
+
+/**
+ * Generate a unique session ID
+ */
+function generateSessionId(): string {
+  return `live_${crypto.randomUUID().slice(0, 8)}`
+}
+
+/**
+ * Create a live Browserless session with shareable URL for manual CAPTCHA solving
+ * Requires Browserless.io with record=true for LiveURL support
+ * Note: Live URL feature may not work with stealth mode, so we use standard chromium
+ */
+export async function createLiveSession(): Promise<LiveSession> {
+  if (!BROWSERLESS_API_KEY) {
+    throw new Error('BROWSERLESS_API_KEY required for live sessions')
+  }
+
+  // Use standard chromium (not stealth) for live sessions as stealth may not support liveURL
+  // Build endpoint with launch params for live URL support
+  const params = new URLSearchParams()
+  params.set('token', BROWSERLESS_API_KEY)
+  params.set('launch', JSON.stringify({
+    headless: false, // Required for live viewing
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  }))
+
+  // Use standard chromium endpoint (not stealth) for live URL support
+  const wsEndpoint = `${BROWSERLESS_ENDPOINT}?${params.toString()}`
+
+  console.log('[Live Session] Connecting to Browserless (standard mode for live URL)...')
+  const browser = await puppeteer.connect({
+    browserWSEndpoint: wsEndpoint,
+  })
+
+  const page = await browser.newPage()
+
+  // Set up viewport and user agent
+  await page.setViewport({ width: 1920, height: 1080 })
+  await page.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  )
+
+  // Get live URL via CDP
+  const cdpSession = await page.createCDPSession()
+
+  let liveURL: string | null = null
+
+  try {
+    // Request a live URL with 10 minute timeout
+    const result = await cdpSession.send('Browserless.liveURL' as any, { timeout: 600000 }) as { liveURL: string }
+    liveURL = result.liveURL
+    console.log(`[Live Session] Got live URL: ${liveURL}`)
+  } catch (error) {
+    console.error('[Live Session] Failed to get liveURL via CDP:', error)
+    // Try alternative approach - Browserless may expose live URL differently
+    // If this fails, we'll return null and let the caller handle it
+  }
+
+  // If liveURL is still null, try to construct it from the browser endpoint
+  if (!liveURL) {
+    // Browserless provides live URLs at a predictable endpoint
+    // Format: https://chrome.browserless.io/live?token=XXX&session=YYY
+    try {
+      // Get the WebSocket debugger URL which contains the session ID
+      const wsUrl = browser.wsEndpoint()
+      console.log(`[Live Session] Browser WebSocket URL: ${wsUrl}`)
+
+      // Extract session ID from WebSocket URL (last part of path)
+      const wsUrlParsed = new URL(wsUrl)
+      const pathParts = wsUrlParsed.pathname.split('/')
+      const sessionIdFromWs = pathParts[pathParts.length - 1]
+
+      if (sessionIdFromWs) {
+        // Construct live URL
+        liveURL = `https://chrome.browserless.io/devtools/inspector.html?wss=chrome.browserless.io/devtools/page/${sessionIdFromWs}?token=${BROWSERLESS_API_KEY}`
+        console.log(`[Live Session] Constructed DevTools URL: ${liveURL}`)
+      }
+    } catch (error) {
+      console.error('[Live Session] Failed to construct live URL:', error)
+    }
+  }
+
+  const sessionId = generateSessionId()
+  const session: LiveSession = {
+    sessionId,
+    liveURL: liveURL || 'Unable to get live URL - use cookie upload method instead',
+    browser,
+    page,
+    cdpSession,
+    createdAt: Date.now(),
+  }
+
+  // Store the session
+  liveSessions.set(sessionId, session)
+
+  // Schedule cleanup
+  setTimeout(() => {
+    closeLiveSession(sessionId).catch(console.error)
+  }, LIVE_SESSION_TTL)
+
+  return session
+}
+
+/**
+ * Store a live session (used internally)
+ */
+export function storeLiveSession(sessionId: string, browser: Browser, page: Page, cdpSession: CDPSession, liveURL: string): void {
+  liveSessions.set(sessionId, {
+    sessionId,
+    liveURL,
+    browser,
+    page,
+    cdpSession,
+    createdAt: Date.now(),
+  })
+}
+
+/**
+ * Get a stored live session by ID
+ */
+export function getLiveSession(sessionId: string): LiveSession | undefined {
+  return liveSessions.get(sessionId)
+}
+
+/**
+ * Close and clean up a live session
+ */
+export async function closeLiveSession(sessionId: string): Promise<void> {
+  const session = liveSessions.get(sessionId)
+  if (!session) {
+    console.log(`[Live Session] Session ${sessionId} not found or already closed`)
+    return
+  }
+
+  try {
+    await session.browser.close()
+    console.log(`[Live Session] Closed session ${sessionId}`)
+  } catch (error) {
+    console.error(`[Live Session] Error closing session ${sessionId}:`, error)
+  }
+
+  liveSessions.delete(sessionId)
+}
+
+/**
+ * Extract session cookies from a live session page
+ * Used after manual login to get the TradingView session
+ */
+export async function extractSessionCookies(sessionId: string): Promise<{
+  sessionId: string
+  sessionIdSign: string
+} | null> {
+  const session = getLiveSession(sessionId)
+  if (!session) {
+    console.log(`[Live Session] Session ${sessionId} not found`)
+    return null
+  }
+
+  const cookies = await session.page.cookies('https://www.tradingview.com')
+  const sessionIdCookie = cookies.find(c => c.name === 'sessionid')
+  const signatureCookie = cookies.find(c => c.name === 'sessionid_sign')
+
+  if (!sessionIdCookie || !signatureCookie) {
+    console.log('[Live Session] Session cookies not found - user may not have logged in yet')
+    return null
+  }
+
+  return {
+    sessionId: sessionIdCookie.value,
+    sessionIdSign: signatureCookie.value,
   }
 }

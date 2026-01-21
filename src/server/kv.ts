@@ -131,7 +131,7 @@ export function hashScript(script: string): string {
 // ============ Publish Jobs ============
 
 export async function createPublishJob(
-  params: Omit<PublishJob, 'jobId' | 'status' | 'createdAt' | 'updatedAt'>
+  params: Omit<PublishJob, 'jobId' | 'status' | 'createdAt' | 'updatedAt'> & { indicatorUrl?: string }
 ): Promise<PublishJob> {
   const job: PublishJob = {
     ...params,
@@ -181,8 +181,8 @@ export async function updatePublishJob(
 // ============ Service Account Session Storage ============
 // Persists TradingView service account session to Redis to survive server restarts
 
-// Session TTL: 7 days (TradingView sessions typically last weeks)
-const SERVICE_ACCOUNT_SESSION_TTL = 7 * 24 * 60 * 60
+// No TTL - sessions persist until cleared or auth fails
+// TradingView sessions last indefinitely unless explicitly logged out
 
 export interface ServiceAccountSession {
   sessionId: string
@@ -198,8 +198,8 @@ const SERVICE_ACCOUNT_KEY = 'service-account:session'
  * This allows the session to persist across server restarts
  */
 export async function saveServiceAccountSession(session: ServiceAccountSession): Promise<void> {
-  await store.set(SERVICE_ACCOUNT_KEY, JSON.stringify(session), { ex: SERVICE_ACCOUNT_SESSION_TTL })
-  console.log('[KV] Service account session saved to Redis (TTL: 7 days)')
+  await store.set(SERVICE_ACCOUNT_KEY, JSON.stringify(session))
+  console.log('[KV] Service account session saved to Redis (no expiry)')
 }
 
 /**

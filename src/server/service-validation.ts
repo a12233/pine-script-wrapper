@@ -8,8 +8,8 @@
  * - Centralized credential management
  *
  * Session persistence:
- * - Sessions are stored in Redis to survive server restarts
- * - TTL is 7 days (TradingView sessions typically last weeks)
+ * - Sessions are stored in Redis to survive server restarts (no expiry)
+ * - Sessions persist until cleared or auth fails
  * - Falls back to in-memory cache if Redis is unavailable
  */
 
@@ -24,13 +24,10 @@ import {
   saveServiceAccountSession,
   getServiceAccountSession,
   clearServiceAccountSession,
-  type ServiceAccountSession,
 } from './kv'
 
-// In-memory cache as fallback and for quick access
+// In-memory cache as fallback and for quick access (no expiry)
 let cachedServiceCredentials: TVCredentials | null = null
-let credentialsCacheTime: number = 0
-const CREDENTIALS_CACHE_TTL = 6 * 60 * 60 * 1000 // 6 hours for in-memory cache
 
 /**
  * Get service account credentials from environment variables
@@ -46,9 +43,8 @@ export async function getServiceAccountCredentials(): Promise<TVCredentials | nu
     return null
   }
 
-  // Check in-memory cache first (fastest)
-  const now = Date.now()
-  if (cachedServiceCredentials && (now - credentialsCacheTime) < CREDENTIALS_CACHE_TTL) {
+  // Check in-memory cache first (fastest, no expiry)
+  if (cachedServiceCredentials) {
     console.log('[ServiceValidation] Using cached service account credentials')
     return cachedServiceCredentials
   }
@@ -64,7 +60,6 @@ export async function getServiceAccountCredentials(): Promise<TVCredentials | nu
       }
       // Update in-memory cache
       cachedServiceCredentials = credentials
-      credentialsCacheTime = now
       console.log('[ServiceValidation] Using service account credentials from Redis')
       return credentials
     }
@@ -79,7 +74,6 @@ export async function getServiceAccountCredentials(): Promise<TVCredentials | nu
   if (credentials) {
     // Update in-memory cache
     cachedServiceCredentials = credentials
-    credentialsCacheTime = now
 
     // Persist to Redis
     try {
@@ -87,7 +81,7 @@ export async function getServiceAccountCredentials(): Promise<TVCredentials | nu
         sessionId: credentials.sessionId,
         signature: credentials.signature,
         userId: credentials.userId,
-        cachedAt: now,
+        cachedAt: Date.now(),
       })
     } catch (error) {
       console.error('[ServiceValidation] Failed to save session to Redis:', error)
@@ -107,7 +101,6 @@ export async function getServiceAccountCredentials(): Promise<TVCredentials | nu
  */
 export async function clearServiceAccountCache(): Promise<void> {
   cachedServiceCredentials = null
-  credentialsCacheTime = 0
 
   try {
     await clearServiceAccountSession()
