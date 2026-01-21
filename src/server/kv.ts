@@ -177,3 +177,54 @@ export async function updatePublishJob(
   await store.set(`job:${jobId}`, JSON.stringify(updated), { ex: JOB_TTL })
   return updated
 }
+
+// ============ Service Account Session Storage ============
+// Persists TradingView service account session to Redis to survive server restarts
+
+// Session TTL: 7 days (TradingView sessions typically last weeks)
+const SERVICE_ACCOUNT_SESSION_TTL = 7 * 24 * 60 * 60
+
+export interface ServiceAccountSession {
+  sessionId: string
+  signature: string
+  userId: string
+  cachedAt: number
+}
+
+const SERVICE_ACCOUNT_KEY = 'service-account:session'
+
+/**
+ * Save service account session to Redis
+ * This allows the session to persist across server restarts
+ */
+export async function saveServiceAccountSession(session: ServiceAccountSession): Promise<void> {
+  await store.set(SERVICE_ACCOUNT_KEY, JSON.stringify(session), { ex: SERVICE_ACCOUNT_SESSION_TTL })
+  console.log('[KV] Service account session saved to Redis (TTL: 7 days)')
+}
+
+/**
+ * Get service account session from Redis
+ * Returns null if no session exists or if it has expired
+ */
+export async function getServiceAccountSession(): Promise<ServiceAccountSession | null> {
+  const data = await store.get<string>(SERVICE_ACCOUNT_KEY)
+  if (!data) return null
+
+  try {
+    const session = JSON.parse(data) as ServiceAccountSession
+    console.log('[KV] Service account session loaded from Redis')
+    return session
+  } catch {
+    console.error('[KV] Failed to parse service account session')
+    return null
+  }
+}
+
+/**
+ * Clear service account session from Redis
+ * Call this when the session becomes invalid
+ */
+export async function clearServiceAccountSession(): Promise<void> {
+  await store.del(SERVICE_ACCOUNT_KEY)
+  console.log('[KV] Service account session cleared from Redis')
+}
