@@ -94,6 +94,8 @@ export interface PublishJob {
   userId: string
   scriptHash: string
   script: string
+  originalScript?: string // Original script before AI fix
+  fixApplied?: boolean // Whether AI fix was applied
   title: string
   description: string
   visibility: 'public' | 'private'

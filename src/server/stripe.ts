@@ -35,8 +35,12 @@ export async function createCheckoutSession(
 
   const { scriptHash, userId, priceInCents = 999, productName = 'Pine Script Publishing' } = params
 
+  // Disable Link (save payment info) in dev to simplify testing
+  const isDev = APP_URL.includes('localhost') || process.env.NODE_ENV === 'development'
+
   const session = await stripe.checkout.sessions.create({
     mode: 'payment',
+    payment_method_types: isDev ? ['card'] : undefined, // undefined = let Stripe show all methods
     line_items: [
       {
         price_data: {

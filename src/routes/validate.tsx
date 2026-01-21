@@ -7,6 +7,7 @@ import { createCheckoutSession } from '../server/stripe'
 
 interface ValidationState {
   script: string
+  originalScript: string // Keep original for diff comparison
   status: 'idle' | 'validating' | 'done' | 'error'
   result?: ValidationLoopResult
   error?: string
@@ -20,8 +21,8 @@ const validateScript = createServerFn()
 
 // Server function to create checkout session
 const createCheckout = createServerFn()
-  .handler(async (ctx: { data: { script: string; title: string; description: string; visibility: 'public' | 'private' } }) => {
-    const { script, title, description, visibility } = ctx.data
+  .handler(async (ctx: { data: { script: string; originalScript: string; fixApplied: boolean; title: string; description: string; visibility: 'public' | 'private' } }) => {
+    const { script, originalScript, fixApplied, title, description, visibility } = ctx.data
     const scriptHash = hashScript(script)
 
     // Generate a userId for this transaction (no login required)
@@ -33,11 +34,13 @@ const createCheckout = createServerFn()
       userId,
     })
 
-    // Create pending job
+    // Create pending job (store original script if AI fix was applied)
     await createPublishJob({
       userId,
       scriptHash,
       script,
+      originalScript: fixApplied ? originalScript : undefined,
+      fixApplied,
       title,
       description,
       visibility,
@@ -55,6 +58,7 @@ function ValidatePage() {
   const navigate = useNavigate()
   const [state, setState] = useState<ValidationState>({
     script: '',
+    originalScript: '',
     status: 'idle',
   })
   const [title, setTitle] = useState('')
@@ -75,7 +79,7 @@ function ValidatePage() {
     const pendingScript = sessionStorage.getItem('pendingScript')
     if (pendingScript) {
       validationStartedRef.current = true
-      setState((s) => ({ ...s, script: pendingScript }))
+      setState((s) => ({ ...s, script: pendingScript, originalScript: pendingScript }))
       // Start validation
       runValidation(pendingScript)
     } else {
@@ -112,9 +116,12 @@ function ValidatePage() {
 
     setIsCreatingCheckout(true)
     try {
+      const fixApplied = state.result?.fixAttempted && state.result?.fixSuccessful
       const result = await createCheckout({
         data: {
           script: state.script,
+          originalScript: state.originalScript,
+          fixApplied: !!fixApplied,
           title: title.trim(),
           description: description.trim(),
           visibility,
@@ -208,7 +215,7 @@ function ValidatePage() {
               <div className="fix-info">
                 {state.result.fixSuccessful ? (
                   <p className="fix-success">
-                    AI automatically fixed errors in your script. The corrected version is shown below.
+                    AI automatically fixed errors in your script. The corrected version will be available after payment.
                   </p>
                 ) : (
                   <p className="fix-failed">
@@ -305,15 +312,6 @@ function ValidatePage() {
             </div>
           )}
 
-          {/* Show the script if it was modified */}
-          {state.result.fixAttempted && state.result.fixSuccessful && (
-            <div className="card">
-              <div className="card-header">
-                <h2>Corrected Script</h2>
-              </div>
-              <pre className="script-preview">{state.script}</pre>
-            </div>
-          )}
         </>
       )}
 

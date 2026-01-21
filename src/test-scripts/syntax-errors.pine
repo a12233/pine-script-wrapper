@@ -1,0 +1,29 @@
+//@version=5
+// Test script with intentional syntax errors for AI auto-fix testing
+indicator("Test Script with Errors", overlay=true)
+
+// Error 1: Wrong function name (smas instead of sma)
+ma20 = ta.smas(close, 20)
+ma50 = ta.sma(close, 50)
+
+// Error 2: Missing closing parenthesis
+rsi = ta.rsi(close, 14
+
+// Error 3: Using undefined variable
+plot(ma20, color=myColor, linewidth=2)
+plot(ma50, color=color.red, linewidth=2)
+
+// Error 4: Wrong comparison operator (single = instead of ==)
+isAbove = close > ma20 and ma20 > ma50
+signal = isAbove = true ? 1 : 0
+
+// Error 5: Missing comma in function call
+plotshape(isAbove style=shape.triangleup, location=location.belowbar, color=color.green)
+
+// Error 6: Incorrect string concatenation (+ instead of str.concat or proper syntax)
+labelText = "Price: " + close
+
+// Error 7: Using 'var' incorrectly with reassignment
+var int counter = 0
+counter = counter + 1
+label.new(bar_index, high, str.tostring(counter))

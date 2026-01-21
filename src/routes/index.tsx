@@ -3,6 +3,10 @@ import { useState } from 'react'
 import { createServerFn } from '@tanstack/react-start'
 import { quickSyntaxCheck } from '../server/ai'
 
+// Test scripts for dev mode
+import COMPLEX_VALID_SCRIPT from '../test-scripts/complex-valid.pine?raw'
+import SYNTAX_ERRORS_SCRIPT from '../test-scripts/syntax-errors.pine?raw'
+
 // Server function for quick syntax validation
 const validateSyntax = createServerFn()
   .handler(async (ctx: { data: { script: string } }) => {
@@ -32,6 +36,9 @@ crossDown = ta.crossunder(ma20, ma50)
 plotshape(crossUp, style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
 plotshape(crossDown, style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
 `
+
+// Check if running in dev mode (localhost)
+const isDev = typeof window !== 'undefined' && window.location.hostname === 'localhost'
 
 function Home() {
   const navigate = useNavigate()
@@ -81,6 +88,29 @@ indicator("My Script", overlay=true)
 plot(close)`}
           rows={20}
         />
+
+        {/* Dev-only test script buttons */}
+        {isDev && (
+          <div className="dev-buttons" style={{ marginBottom: '1rem', padding: '0.5rem', backgroundColor: '#1a1a2e', borderRadius: '4px', border: '1px dashed #ff6b6b' }}>
+            <small style={{ color: '#ff6b6b', display: 'block', marginBottom: '0.5rem' }}>Dev Mode: Test Scripts</small>
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <button
+                className="btn btn-secondary"
+                style={{ fontSize: '0.75rem', padding: '0.25rem 0.5rem' }}
+                onClick={() => setScript(SYNTAX_ERRORS_SCRIPT)}
+              >
+                Load Script with Errors (Test Auto-Fix)
+              </button>
+              <button
+                className="btn btn-secondary"
+                style={{ fontSize: '0.75rem', padding: '0.25rem 0.5rem' }}
+                onClick={() => setScript(COMPLEX_VALID_SCRIPT)}
+              >
+                Load Complex Valid Script
+              </button>
+            </div>
+          </div>
+        )}
 
         {syntaxIssues.length > 0 && (
           <div className="issues-panel">
