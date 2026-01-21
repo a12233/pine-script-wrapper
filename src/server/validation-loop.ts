@@ -5,7 +5,8 @@
  * 1. Validate script with service account
  * 2. If errors, attempt AI-powered fix (1 retry max)
  * 3. Re-validate with fixed script
- * 4. Return final result
+ * 4. Optionally publish after successful validation
+ * 5. Return final result with indicator URL
  */
 
 import { generateText } from 'ai'
@@ -13,6 +14,7 @@ import { createOpenAI } from '@ai-sdk/openai'
 import {
   validateWithServiceAccount,
   formatErrorsForLLM,
+  getServiceAccountCredentials,
   type FullValidationResult,
 } from './service-validation'
 import {
@@ -20,6 +22,8 @@ import {
   buildFixPrompt,
   extractPineScript,
 } from './prompts/pine-script-fix'
+import { publishPineScript } from './tradingview'
+import { startTimer } from './timing'
 
 // OpenRouter client
 const openrouter = createOpenAI({
@@ -28,6 +32,15 @@ const openrouter = createOpenAI({
 })
 
 const DEFAULT_MODEL = process.env.OPENROUTER_MODEL || 'anthropic/claude-sonnet-4'
+
+/**
+ * Options for publishing after validation
+ */
+export interface PublishAfterValidationOptions {
+  title: string
+  description: string
+  visibility: 'public' | 'private'
+}
 
 /**
  * Result of the validation loop
@@ -53,6 +66,10 @@ export interface ValidationLoopResult {
   rawOutput: string
   /** Whether script was successfully added to chart */
   addedToChart: boolean
+  /** URL of published indicator (if publish was requested and successful) */
+  indicatorUrl?: string
+  /** Error from publish attempt (if publish failed) */
+  publishError?: string
 }
 
 /**
@@ -82,12 +99,15 @@ async function fixPineScriptErrors(script: string, errors: string): Promise<stri
  *
  * @param script - The Pine Script to validate
  * @param maxRetries - Maximum fix attempts (default: 1)
+ * @param publishOptions - Optional: publish the script after successful validation
  * @returns Validation result with final script and status
  */
 export async function runValidationLoop(
   script: string,
-  maxRetries: number = 1
+  maxRetries: number = 1,
+  publishOptions?: PublishAfterValidationOptions
 ): Promise<ValidationLoopResult> {
+  const timer = startTimer('ValidationLoop', 'validation loop')
   let currentScript = script
   let iterations = 0
   let fixAttempted = false
@@ -100,9 +120,29 @@ export async function runValidationLoop(
   iterations++
   console.log(`[ValidationLoop] Iteration ${iterations}: Validating script...`)
   lastResult = await validateWithServiceAccount(currentScript)
+  timer.mark('first validation')
 
   if (lastResult.isValid) {
     console.log('[ValidationLoop] Script is valid on first attempt')
+
+    // If publish options provided, publish the script
+    if (publishOptions) {
+      const publishResult = await publishAfterValidation(currentScript, publishOptions, timer)
+      return {
+        finalScript: currentScript,
+        isValid: true,
+        iterations,
+        fixAttempted: false,
+        fixSuccessful: false,
+        finalErrors: [],
+        rawOutput: lastResult.rawOutput,
+        addedToChart: lastResult.addedToChart,
+        indicatorUrl: publishResult.indicatorUrl,
+        publishError: publishResult.error,
+      }
+    }
+
+    timer.end()
     return {
       finalScript: currentScript,
       isValid: true,
@@ -138,6 +178,26 @@ export async function runValidationLoop(
         if (lastResult.isValid) {
           console.log('[ValidationLoop] AI fix successful - script is now valid')
           fixSuccessful = true
+          timer.mark('AI fix successful')
+
+          // If publish options provided, publish the script
+          if (publishOptions) {
+            const publishResult = await publishAfterValidation(currentScript, publishOptions, timer)
+            return {
+              finalScript: currentScript,
+              isValid: true,
+              iterations,
+              fixAttempted: true,
+              fixSuccessful: true,
+              finalErrors: [],
+              rawOutput: lastResult.rawOutput,
+              addedToChart: lastResult.addedToChart,
+              indicatorUrl: publishResult.indicatorUrl,
+              publishError: publishResult.error,
+            }
+          }
+
+          timer.end()
           return {
             finalScript: currentScript,
             isValid: true,
@@ -160,6 +220,7 @@ export async function runValidationLoop(
 
   // Return final result (script is still invalid)
   console.log(`[ValidationLoop] Validation complete after ${iterations} iterations - script is invalid`)
+  timer.end()
   return {
     finalScript: currentScript,
     isValid: false,
@@ -169,6 +230,49 @@ export async function runValidationLoop(
     finalErrors: lastResult?.errors || [],
     rawOutput: lastResult?.rawOutput || '',
     addedToChart: lastResult?.addedToChart || false,
+  }
+}
+
+/**
+ * Helper function to publish a script after successful validation
+ */
+async function publishAfterValidation(
+  script: string,
+  options: PublishAfterValidationOptions,
+  timer: ReturnType<typeof startTimer>
+): Promise<{ indicatorUrl?: string; error?: string }> {
+  console.log('[ValidationLoop] Publishing script after successful validation...')
+  timer.mark('starting publish')
+
+  try {
+    const credentials = await getServiceAccountCredentials()
+    if (!credentials) {
+      console.error('[ValidationLoop] Failed to get service account credentials for publish')
+      return { error: 'Service account authentication failed' }
+    }
+
+    const publishResult = await publishPineScript(credentials, {
+      script,
+      title: options.title,
+      description: options.description,
+      visibility: options.visibility,
+    })
+
+    timer.mark('publish complete')
+
+    if (publishResult.success) {
+      console.log(`[ValidationLoop] Script published successfully: ${publishResult.indicatorUrl}`)
+      timer.end()
+      return { indicatorUrl: publishResult.indicatorUrl }
+    } else {
+      console.error(`[ValidationLoop] Publish failed: ${publishResult.error}`)
+      timer.end()
+      return { error: publishResult.error }
+    }
+  } catch (error) {
+    console.error('[ValidationLoop] Publish error:', error)
+    timer.end()
+    return { error: error instanceof Error ? error.message : 'Unknown publish error' }
   }
 }
 

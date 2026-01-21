@@ -3,8 +3,7 @@ import { useEffect, useState } from 'react'
 import { createServerFn } from '@tanstack/react-start'
 import { getJobByStripeSession, updatePublishJob } from '../server/kv'
 import { getCheckoutSession } from '../server/stripe'
-import { publishPineScript } from '../server/tradingview'
-import { getServiceAccountCredentials } from '../server/service-validation'
+import { startTimer } from '../server/timing'
 
 interface JobStatus {
   status: 'loading' | 'publishing' | 'success' | 'failed'
@@ -16,19 +15,25 @@ interface JobStatus {
   title?: string
 }
 
-// Server function to check payment and publish status
+// Server function to check payment status and return stored URL
+// NO BROWSER AUTOMATION - URL was stored during validation+publish step
 const checkJobStatus = createServerFn()
   .handler(async (ctx: { data: { sessionId: string } }) => {
+    const timer = startTimer('Success', 'check job status')
     const { sessionId } = ctx.data
 
     // Get the job for this Stripe session
     const job = await getJobByStripeSession(sessionId)
     if (!job) {
+      timer.end()
       return { status: 'failed' as const, error: 'Job not found' }
     }
 
+    timer.mark('job found')
+
     // If already completed, return the result with script data
     if (job.status === 'completed') {
+      timer.end()
       return {
         status: 'success' as const,
         indicatorUrl: job.indicatorUrl,
@@ -40,60 +45,34 @@ const checkJobStatus = createServerFn()
     }
 
     if (job.status === 'failed') {
+      timer.end()
       return { status: 'failed' as const, error: job.error }
-    }
-
-    // If already processing, just wait (don't start another publish)
-    if (job.status === 'processing') {
-      return { status: 'publishing' as const }
     }
 
     // Check if payment was successful
     const checkout = await getCheckoutSession(sessionId)
+    timer.mark('checkout checked')
+
     if (checkout.payment_status !== 'paid') {
+      timer.end()
       return { status: 'failed' as const, error: 'Payment not completed' }
     }
 
-    // Payment successful, start publishing
-    await updatePublishJob(job.jobId, { status: 'processing' })
+    // Payment successful - just mark as completed and return stored URL
+    // NO BROWSER AUTOMATION NEEDED - URL was stored during validation+publish step
+    console.log(`[Success] Payment confirmed for job ${job.jobId}, returning stored URL: ${job.indicatorUrl}`)
 
-    // Get service account credentials (no user credentials needed)
-    const credentials = await getServiceAccountCredentials()
-    if (!credentials) {
-      await updatePublishJob(job.jobId, {
-        status: 'failed',
-        error: 'Service account authentication failed',
-      })
-      return { status: 'failed' as const, error: 'Service account authentication failed' }
-    }
+    await updatePublishJob(job.jobId, { status: 'completed' })
+    timer.mark('job marked complete')
 
-    // Publish the script using service account
-    const result = await publishPineScript(credentials, {
+    timer.end()
+    return {
+      status: 'success' as const,
+      indicatorUrl: job.indicatorUrl,
       script: job.script,
+      originalScript: job.originalScript,
+      fixApplied: job.fixApplied,
       title: job.title,
-      description: job.description,
-      visibility: job.visibility,
-    })
-
-    if (result.success) {
-      await updatePublishJob(job.jobId, {
-        status: 'completed',
-        indicatorUrl: result.indicatorUrl || 'URL not available - check TradingView',
-      })
-      return {
-        status: 'success' as const,
-        indicatorUrl: result.indicatorUrl || undefined,
-        script: job.script,
-        originalScript: job.originalScript,
-        fixApplied: job.fixApplied,
-        title: job.title,
-      }
-    } else {
-      await updatePublishJob(job.jobId, {
-        status: 'failed',
-        error: result.error || 'Publishing failed',
-      })
-      return { status: 'failed' as const, error: result.error || 'Publishing failed' }
     }
   })
 

@@ -131,7 +131,7 @@ export function hashScript(script: string): string {
 // ============ Publish Jobs ============
 
 export async function createPublishJob(
-  params: Omit<PublishJob, 'jobId' | 'status' | 'createdAt' | 'updatedAt'>
+  params: Omit<PublishJob, 'jobId' | 'status' | 'createdAt' | 'updatedAt'> & { indicatorUrl?: string }
 ): Promise<PublishJob> {
   const job: PublishJob = {
     ...params,
