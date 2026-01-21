@@ -1,6 +1,6 @@
 import Stripe from 'stripe'
 
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY
+const STRIPE_SECRET_KEY = process.env.STRIPE_PROD_SECRET_KEY
 const APP_URL = process.env.APP_URL || 'http://localhost:3000'
 
 if (!STRIPE_SECRET_KEY) {
@@ -30,45 +30,55 @@ export async function createCheckoutSession(
   params: CreateCheckoutParams
 ): Promise<CheckoutSession> {
   if (!stripe) {
+    console.error('[Stripe] Stripe is not configured - STRIPE_PROD_SECRET_KEY not set')
     throw new Error('Stripe is not configured')
   }
 
-  const { scriptHash, userId, priceInCents = 999, productName = 'Pine Script Publishing' } = params
+  console.log('[Stripe] Creating checkout session...')
+
+  const { scriptHash, userId, priceInCents = 100, productName = 'Pine Script Publishing' } = params
+
+  // Use existing Stripe product ID in production
+  const STRIPE_PRODUCT_ID = 'prod_TnGtj83MsKmx7s'
 
   // Disable Link (save payment info) in dev to simplify testing
   const isDev = APP_URL.includes('localhost') || process.env.NODE_ENV === 'development'
 
-  const session = await stripe.checkout.sessions.create({
-    mode: 'payment',
-    payment_method_types: isDev ? ['card'] : undefined, // undefined = let Stripe show all methods
-    line_items: [
-      {
-        price_data: {
-          currency: 'usd',
-          product_data: {
-            name: productName,
-            description: 'Validate and publish your Pine Script as a private TradingView indicator',
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: isDev ? ['card'] : undefined, // undefined = let Stripe show all methods
+      allow_promotion_codes: true, // Show promo code field in checkout
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product: STRIPE_PRODUCT_ID, // Use existing product from Stripe dashboard
+            unit_amount: priceInCents, // $1.00
           },
-          unit_amount: priceInCents,
+          quantity: 1,
         },
-        quantity: 1,
+      ],
+      metadata: {
+        scriptHash,
+        userId,
       },
-    ],
-    metadata: {
-      scriptHash,
-      userId,
-    },
-    success_url: `${APP_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${APP_URL}/?canceled=true`,
-  })
+      success_url: `${APP_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${APP_URL}/?canceled=true`,
+    })
 
-  if (!session.url) {
-    throw new Error('Failed to create checkout session URL')
-  }
+    if (!session.url) {
+      throw new Error('Failed to create checkout session URL')
+    }
 
-  return {
-    sessionId: session.id,
-    url: session.url,
+    console.log('[Stripe] Checkout session created:', session.id)
+    return {
+      sessionId: session.id,
+      url: session.url,
+    }
+  } catch (error) {
+    console.error('[Stripe] Failed to create checkout session:', error)
+    throw error
   }
 }
 

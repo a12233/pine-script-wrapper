@@ -13,6 +13,11 @@ import { Route as ValidateRouteImport } from './routes/validate'
 import { Route as SuccessRouteImport } from './routes/success'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiStripeWebhookRouteImport } from './routes/api/stripe/webhook'
+import { Route as ApiAdminTvSessionIndexRouteImport } from './routes/api/admin/tv-session/index'
+import { Route as ApiAdminTvSessionUploadRouteImport } from './routes/api/admin/tv-session/upload'
+import { Route as ApiAdminTvSessionStatusRouteImport } from './routes/api/admin/tv-session/status'
+import { Route as ApiAdminTvSessionLiveRouteImport } from './routes/api/admin/tv-session/live'
+import { Route as ApiAdminTvSessionFinalizeRouteImport } from './routes/api/admin/tv-session/finalize'
 
 const ValidateRoute = ValidateRouteImport.update({
   id: '/validate',
@@ -34,18 +39,54 @@ const ApiStripeWebhookRoute = ApiStripeWebhookRouteImport.update({
   path: '/api/stripe/webhook',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiAdminTvSessionIndexRoute = ApiAdminTvSessionIndexRouteImport.update({
+  id: '/api/admin/tv-session/',
+  path: '/api/admin/tv-session/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiAdminTvSessionUploadRoute = ApiAdminTvSessionUploadRouteImport.update({
+  id: '/api/admin/tv-session/upload',
+  path: '/api/admin/tv-session/upload',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiAdminTvSessionStatusRoute = ApiAdminTvSessionStatusRouteImport.update({
+  id: '/api/admin/tv-session/status',
+  path: '/api/admin/tv-session/status',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiAdminTvSessionLiveRoute = ApiAdminTvSessionLiveRouteImport.update({
+  id: '/api/admin/tv-session/live',
+  path: '/api/admin/tv-session/live',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiAdminTvSessionFinalizeRoute =
+  ApiAdminTvSessionFinalizeRouteImport.update({
+    id: '/api/admin/tv-session/finalize',
+    path: '/api/admin/tv-session/finalize',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/success': typeof SuccessRoute
   '/validate': typeof ValidateRoute
   '/api/stripe/webhook': typeof ApiStripeWebhookRoute
+  '/api/admin/tv-session/finalize': typeof ApiAdminTvSessionFinalizeRoute
+  '/api/admin/tv-session/live': typeof ApiAdminTvSessionLiveRoute
+  '/api/admin/tv-session/status': typeof ApiAdminTvSessionStatusRoute
+  '/api/admin/tv-session/upload': typeof ApiAdminTvSessionUploadRoute
+  '/api/admin/tv-session': typeof ApiAdminTvSessionIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/success': typeof SuccessRoute
   '/validate': typeof ValidateRoute
   '/api/stripe/webhook': typeof ApiStripeWebhookRoute
+  '/api/admin/tv-session/finalize': typeof ApiAdminTvSessionFinalizeRoute
+  '/api/admin/tv-session/live': typeof ApiAdminTvSessionLiveRoute
+  '/api/admin/tv-session/status': typeof ApiAdminTvSessionStatusRoute
+  '/api/admin/tv-session/upload': typeof ApiAdminTvSessionUploadRoute
+  '/api/admin/tv-session': typeof ApiAdminTvSessionIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -53,13 +94,46 @@ export interface FileRoutesById {
   '/success': typeof SuccessRoute
   '/validate': typeof ValidateRoute
   '/api/stripe/webhook': typeof ApiStripeWebhookRoute
+  '/api/admin/tv-session/finalize': typeof ApiAdminTvSessionFinalizeRoute
+  '/api/admin/tv-session/live': typeof ApiAdminTvSessionLiveRoute
+  '/api/admin/tv-session/status': typeof ApiAdminTvSessionStatusRoute
+  '/api/admin/tv-session/upload': typeof ApiAdminTvSessionUploadRoute
+  '/api/admin/tv-session/': typeof ApiAdminTvSessionIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/success' | '/validate' | '/api/stripe/webhook'
+  fullPaths:
+    | '/'
+    | '/success'
+    | '/validate'
+    | '/api/stripe/webhook'
+    | '/api/admin/tv-session/finalize'
+    | '/api/admin/tv-session/live'
+    | '/api/admin/tv-session/status'
+    | '/api/admin/tv-session/upload'
+    | '/api/admin/tv-session'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/success' | '/validate' | '/api/stripe/webhook'
-  id: '__root__' | '/' | '/success' | '/validate' | '/api/stripe/webhook'
+  to:
+    | '/'
+    | '/success'
+    | '/validate'
+    | '/api/stripe/webhook'
+    | '/api/admin/tv-session/finalize'
+    | '/api/admin/tv-session/live'
+    | '/api/admin/tv-session/status'
+    | '/api/admin/tv-session/upload'
+    | '/api/admin/tv-session'
+  id:
+    | '__root__'
+    | '/'
+    | '/success'
+    | '/validate'
+    | '/api/stripe/webhook'
+    | '/api/admin/tv-session/finalize'
+    | '/api/admin/tv-session/live'
+    | '/api/admin/tv-session/status'
+    | '/api/admin/tv-session/upload'
+    | '/api/admin/tv-session/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -67,6 +141,11 @@ export interface RootRouteChildren {
   SuccessRoute: typeof SuccessRoute
   ValidateRoute: typeof ValidateRoute
   ApiStripeWebhookRoute: typeof ApiStripeWebhookRoute
+  ApiAdminTvSessionFinalizeRoute: typeof ApiAdminTvSessionFinalizeRoute
+  ApiAdminTvSessionLiveRoute: typeof ApiAdminTvSessionLiveRoute
+  ApiAdminTvSessionStatusRoute: typeof ApiAdminTvSessionStatusRoute
+  ApiAdminTvSessionUploadRoute: typeof ApiAdminTvSessionUploadRoute
+  ApiAdminTvSessionIndexRoute: typeof ApiAdminTvSessionIndexRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -99,6 +178,41 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiStripeWebhookRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/admin/tv-session/': {
+      id: '/api/admin/tv-session/'
+      path: '/api/admin/tv-session'
+      fullPath: '/api/admin/tv-session'
+      preLoaderRoute: typeof ApiAdminTvSessionIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/admin/tv-session/upload': {
+      id: '/api/admin/tv-session/upload'
+      path: '/api/admin/tv-session/upload'
+      fullPath: '/api/admin/tv-session/upload'
+      preLoaderRoute: typeof ApiAdminTvSessionUploadRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/admin/tv-session/status': {
+      id: '/api/admin/tv-session/status'
+      path: '/api/admin/tv-session/status'
+      fullPath: '/api/admin/tv-session/status'
+      preLoaderRoute: typeof ApiAdminTvSessionStatusRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/admin/tv-session/live': {
+      id: '/api/admin/tv-session/live'
+      path: '/api/admin/tv-session/live'
+      fullPath: '/api/admin/tv-session/live'
+      preLoaderRoute: typeof ApiAdminTvSessionLiveRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/admin/tv-session/finalize': {
+      id: '/api/admin/tv-session/finalize'
+      path: '/api/admin/tv-session/finalize'
+      fullPath: '/api/admin/tv-session/finalize'
+      preLoaderRoute: typeof ApiAdminTvSessionFinalizeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -107,6 +221,11 @@ const rootRouteChildren: RootRouteChildren = {
   SuccessRoute: SuccessRoute,
   ValidateRoute: ValidateRoute,
   ApiStripeWebhookRoute: ApiStripeWebhookRoute,
+  ApiAdminTvSessionFinalizeRoute: ApiAdminTvSessionFinalizeRoute,
+  ApiAdminTvSessionLiveRoute: ApiAdminTvSessionLiveRoute,
+  ApiAdminTvSessionStatusRoute: ApiAdminTvSessionStatusRoute,
+  ApiAdminTvSessionUploadRoute: ApiAdminTvSessionUploadRoute,
+  ApiAdminTvSessionIndexRoute: ApiAdminTvSessionIndexRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
