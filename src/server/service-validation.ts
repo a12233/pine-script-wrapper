@@ -6,6 +6,11 @@
  * - End-to-end validation (compile + add to chart)
  * - No user authentication required for validation
  * - Centralized credential management
+ *
+ * Session persistence:
+ * - Sessions are stored in Redis to survive server restarts
+ * - TTL is 7 days (TradingView sessions typically last weeks)
+ * - Falls back to in-memory cache if Redis is unavailable
  */
 
 import {
@@ -15,15 +20,22 @@ import {
   type ValidationResult,
 } from './tradingview'
 
-// Cached service account credentials (in-memory)
+import {
+  saveServiceAccountSession,
+  getServiceAccountSession,
+  clearServiceAccountSession,
+  type ServiceAccountSession,
+} from './kv'
+
+// In-memory cache as fallback and for quick access
 let cachedServiceCredentials: TVCredentials | null = null
 let credentialsCacheTime: number = 0
-const CREDENTIALS_CACHE_TTL = 6 * 60 * 60 * 1000 // 6 hours
+const CREDENTIALS_CACHE_TTL = 6 * 60 * 60 * 1000 // 6 hours for in-memory cache
 
 /**
  * Get service account credentials from environment variables
  * Uses TV_USERNAME and TV_PASSWORD env vars
- * Caches credentials to avoid repeated logins
+ * Caches credentials in Redis (persistent) and in-memory (fast)
  */
 export async function getServiceAccountCredentials(): Promise<TVCredentials | null> {
   const TV_USERNAME = process.env.TV_USERNAME
@@ -34,20 +46,53 @@ export async function getServiceAccountCredentials(): Promise<TVCredentials | nu
     return null
   }
 
-  // Check if cached credentials are still valid
+  // Check in-memory cache first (fastest)
   const now = Date.now()
   if (cachedServiceCredentials && (now - credentialsCacheTime) < CREDENTIALS_CACHE_TTL) {
     console.log('[ServiceValidation] Using cached service account credentials')
     return cachedServiceCredentials
   }
 
-  // Login with environment credentials
+  // Check Redis cache (survives restarts)
+  try {
+    const redisSession = await getServiceAccountSession()
+    if (redisSession) {
+      const credentials: TVCredentials = {
+        sessionId: redisSession.sessionId,
+        signature: redisSession.signature,
+        userId: redisSession.userId,
+      }
+      // Update in-memory cache
+      cachedServiceCredentials = credentials
+      credentialsCacheTime = now
+      console.log('[ServiceValidation] Using service account credentials from Redis')
+      return credentials
+    }
+  } catch (error) {
+    console.error('[ServiceValidation] Failed to load session from Redis:', error)
+  }
+
+  // No valid cached session, need to login
   console.log('[ServiceValidation] Logging in with service account credentials...')
   const credentials = await loginWithCredentials()
 
   if (credentials) {
+    // Update in-memory cache
     cachedServiceCredentials = credentials
     credentialsCacheTime = now
+
+    // Persist to Redis
+    try {
+      await saveServiceAccountSession({
+        sessionId: credentials.sessionId,
+        signature: credentials.signature,
+        userId: credentials.userId,
+        cachedAt: now,
+      })
+    } catch (error) {
+      console.error('[ServiceValidation] Failed to save session to Redis:', error)
+    }
+
     console.log('[ServiceValidation] Service account login successful, credentials cached')
   } else {
     console.error('[ServiceValidation] Service account login failed')
@@ -60,9 +105,16 @@ export async function getServiceAccountCredentials(): Promise<TVCredentials | nu
  * Clear cached service account credentials
  * Call this if credentials become invalid
  */
-export function clearServiceAccountCache(): void {
+export async function clearServiceAccountCache(): Promise<void> {
   cachedServiceCredentials = null
   credentialsCacheTime = 0
+
+  try {
+    await clearServiceAccountSession()
+  } catch (error) {
+    console.error('[ServiceValidation] Failed to clear session from Redis:', error)
+  }
+
   console.log('[ServiceValidation] Service account cache cleared')
 }
 
@@ -115,7 +167,7 @@ export async function validateWithServiceAccount(script: string): Promise<FullVa
     console.error('[ServiceValidation] Validation failed:', error)
 
     // Clear cache in case credentials expired
-    clearServiceAccountCache()
+    await clearServiceAccountCache()
 
     return {
       isValid: false,

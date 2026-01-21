@@ -1,27 +1,27 @@
 # Ralph Fix Plan
 
 ## High Priority
-- [ ] Set up basic project structure and build system
-- [ ] Define core data structures and types
-- [ ] Implement basic input/output handling
-- [ ] Create test framework and initial tests
+- [x] Add "add to chart" validation to /src/server/tradingview.ts (already exists)
 
 ## Medium Priority
-- [ ] Add error handling and validation
-- [ ] Implement core business logic
-- [ ] Add configuration management
-- [ ] Create user documentation
+- [ ] Update /src/routes/validate.tsx to use validation loop (BLOCKED - needs permission)
+- [ ] Update /src/routes/index.tsx to remove connection requirement
+- [ ] Remove /src/routes/connect.tsx
 
 ## Low Priority
-- [ ] Performance optimization
-- [ ] Extended feature set
-- [ ] Integration with external services
-- [ ] Advanced error recovery
+- [ ] Clean up /src/server/kv.ts - remove unused credential functions
+- [ ] Update .env.example with service account vars
+- [ ] Remove any other unused code referencing user credentials
 
 ## Completed
-- [x] Project initialization
+- [x] Create /src/server/service-validation.ts
+- [x] Create /src/server/validation-loop.ts
+- [x] Create /src/server/prompts/pine-script-fix.ts
+- [x] Add fixPineScriptErrors() to validation-loop.ts (inline implementation)
 
 ## Notes
-- Focus on MVP functionality first
-- Ensure each feature is properly tested
-- Update this file after each major milestone
+- Service account uses TV_USERNAME/TV_PASSWORD env vars
+- Max 1 retry for auto-fix loop
+- Show final result only to user
+- "Add to chart" validation already exists in tradingview.ts validatePineScriptV2()
+- BLOCKED: Need write permission for src/routes/validate.tsx and src/routes/index.tsx
