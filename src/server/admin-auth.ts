@@ -3,10 +3,13 @@
  * Provides simple API key verification for admin endpoints
  */
 
+import { timingSafeEqual } from 'crypto'
+
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY
 
 /**
  * Verify admin API key from request headers
+ * Uses constant-time comparison to prevent timing attacks
  * @param request - The incoming request
  * @returns true if the admin key is valid, false otherwise
  */
@@ -21,7 +24,14 @@ export function verifyAdminAuth(request: Request): boolean {
     return false
   }
 
-  return providedKey === ADMIN_API_KEY
+  const providedBuffer = Buffer.from(providedKey)
+  const expectedBuffer = Buffer.from(ADMIN_API_KEY)
+
+  if (providedBuffer.length !== expectedBuffer.length) {
+    return false
+  }
+
+  return timingSafeEqual(providedBuffer, expectedBuffer)
 }
 
 /**
