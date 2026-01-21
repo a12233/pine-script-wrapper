@@ -4,7 +4,7 @@ import { createServerFn } from '@tanstack/react-start'
 import { getJobByStripeSession, updatePublishJob } from '../server/kv'
 import { getCheckoutSession } from '../server/stripe'
 import { publishPineScript } from '../server/tradingview'
-import { getTVCredentials } from '../server/kv'
+import { getServiceAccountCredentials } from '../server/service-validation'
 
 interface JobStatus {
   status: 'loading' | 'publishing' | 'success' | 'failed'
@@ -46,17 +46,17 @@ const checkJobStatus = createServerFn()
     // Payment successful, start publishing
     await updatePublishJob(job.jobId, { status: 'processing' })
 
-    // Get TV credentials
-    const credentials = await getTVCredentials(job.userId)
+    // Get service account credentials (no user credentials needed)
+    const credentials = await getServiceAccountCredentials()
     if (!credentials) {
       await updatePublishJob(job.jobId, {
         status: 'failed',
-        error: 'TradingView session expired',
+        error: 'Service account authentication failed',
       })
-      return { status: 'failed' as const, error: 'TradingView session expired' }
+      return { status: 'failed' as const, error: 'Service account authentication failed' }
     }
 
-    // Publish the script
+    // Publish the script using service account
     const result = await publishPineScript(credentials, {
       script: job.script,
       title: job.title,
@@ -72,7 +72,6 @@ const checkJobStatus = createServerFn()
       return {
         status: 'success' as const,
         indicatorUrl: result.indicatorUrl || undefined,
-        // Note: URL may be undefined for private scripts
       }
     } else {
       await updatePublishJob(job.jobId, {

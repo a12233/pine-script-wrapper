@@ -1,7 +1,8 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { verifyWebhookEvent } from '../../../server/stripe'
-import { getJobByStripeSession, updatePublishJob, getTVCredentials } from '../../../server/kv'
+import { getJobByStripeSession, updatePublishJob } from '../../../server/kv'
 import { publishPineScript } from '../../../server/tradingview'
+import { getServiceAccountCredentials } from '../../../server/service-validation'
 
 export const Route = createFileRoute('/api/stripe/webhook')({
   server: {
@@ -42,16 +43,17 @@ export const Route = createFileRoute('/api/stripe/webhook')({
                 // Update job status to processing
                 await updatePublishJob(job.jobId, { status: 'processing' })
 
-                // Get user's TV credentials
-                const credentials = await getTVCredentials(job.userId)
+                // Get service account credentials (no user credentials needed)
+                const credentials = await getServiceAccountCredentials()
 
                 if (credentials) {
                   try {
-                    // Publish the script to TradingView
+                    // Publish the script to TradingView using service account
                     const result = await publishPineScript(credentials, {
                       script: job.script,
                       title: job.title,
                       description: job.description,
+                      visibility: job.visibility,
                     })
 
                     // Update job with success
@@ -74,10 +76,10 @@ export const Route = createFileRoute('/api/stripe/webhook')({
                 } else {
                   await updatePublishJob(job.jobId, {
                     status: 'failed',
-                    error: 'TradingView credentials not found',
+                    error: 'Service account authentication failed',
                   })
 
-                  console.error(`[Webhook] No TV credentials for user ${job.userId}`)
+                  console.error(`[Webhook] Service account credentials not available`)
                 }
               } else {
                 console.warn(`[Webhook] No job found for session ${session.id}`)
