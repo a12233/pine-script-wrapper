@@ -8,6 +8,8 @@ const HEADLESS_BROWSER = process.env.HEADLESS_BROWSER === 'true' // Run browser 
 const CHROME_PATH = process.env.CHROME_PATH
 const CHROME_USER_DATA_DIR = process.env.CHROME_USER_DATA_DIR // Use existing Chrome profile
 const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH // Set by Dockerfile for production
+const BROWSERLESS_STEALTH = process.env.BROWSERLESS_STEALTH !== 'false' // Default: enabled
+const BROWSERLESS_PROXY = process.env.BROWSERLESS_PROXY // 'residential' or 'datacenter'
 
 /**
  * Auto-detect Chrome user data directory based on OS
@@ -65,6 +67,32 @@ function getChromePath(): string {
   throw new Error(
     `Chrome not found. Install Chrome or set CHROME_PATH env var. Searched: ${osPaths.join(', ')}`
   )
+}
+
+/**
+ * Build Browserless.io WebSocket endpoint URL with stealth and proxy options
+ */
+function buildBrowserlessEndpoint(): string {
+  let endpoint = BROWSERLESS_ENDPOINT
+
+  // Add stealth path if enabled
+  if (BROWSERLESS_STEALTH) {
+    // wss://chrome.browserless.io -> wss://chrome.browserless.io/chromium/stealth
+    const url = new URL(endpoint)
+    if (!url.pathname.includes('/stealth')) {
+      url.pathname = '/chromium/stealth'
+    }
+    endpoint = url.toString()
+  }
+
+  // Build query params
+  const params = new URLSearchParams()
+  params.set('token', BROWSERLESS_API_KEY!)
+  if (BROWSERLESS_PROXY) {
+    params.set('proxy', BROWSERLESS_PROXY)
+  }
+
+  return `${endpoint}?${params.toString()}`
 }
 
 export interface BrowserlessSession {
@@ -143,9 +171,12 @@ export async function createBrowserSession(): Promise<BrowserlessSession> {
     })
   } else if (BROWSERLESS_API_KEY) {
     // Fallback: Connect to Browserless.io
-    console.log('🌐 Connecting to Browserless.io...')
+    const wsEndpoint = buildBrowserlessEndpoint()
+    const mode = BROWSERLESS_STEALTH ? 'stealth' : 'standard'
+    const proxy = BROWSERLESS_PROXY ? ` + ${BROWSERLESS_PROXY} proxy` : ''
+    console.log(`🌐 Connecting to Browserless.io (${mode}${proxy})...`)
     browser = await puppeteer.connect({
-      browserWSEndpoint: `${BROWSERLESS_ENDPOINT}?token=${BROWSERLESS_API_KEY}`,
+      browserWSEndpoint: wsEndpoint,
     })
   } else {
     throw new Error(
