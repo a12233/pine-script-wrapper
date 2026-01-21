@@ -125,3 +125,71 @@ export async function createRefund(paymentIntentId: string): Promise<Stripe.Refu
     reason: 'requested_by_customer',
   })
 }
+
+export interface ProductDetails {
+  productId: string
+  productName: string
+  priceInCents: number
+  priceFormatted: string
+  currency: string
+}
+
+/**
+ * Get product details from Stripe for display in the UI
+ */
+export async function getProductDetails(): Promise<ProductDetails> {
+  const STRIPE_PRODUCT_ID = 'prod_TnGtj83MsKmx7s'
+  const DEFAULT_PRICE_CENTS = 100 // $1.00
+
+  if (!stripe) {
+    // Return defaults when Stripe is not configured (dev mode)
+    return {
+      productId: STRIPE_PRODUCT_ID,
+      productName: 'Pine Script Publishing',
+      priceInCents: DEFAULT_PRICE_CENTS,
+      priceFormatted: '$1.00',
+      currency: 'usd',
+    }
+  }
+
+  try {
+    // Fetch product from Stripe
+    const product = await stripe.products.retrieve(STRIPE_PRODUCT_ID)
+
+    // Get the default price if available, otherwise use our configured price
+    let priceInCents = DEFAULT_PRICE_CENTS
+    let currency = 'usd'
+
+    if (product.default_price && typeof product.default_price === 'string') {
+      const price = await stripe.prices.retrieve(product.default_price)
+      if (price.unit_amount) {
+        priceInCents = price.unit_amount
+      }
+      currency = price.currency
+    }
+
+    // Format price for display
+    const priceFormatted = new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: currency.toUpperCase(),
+    }).format(priceInCents / 100)
+
+    return {
+      productId: STRIPE_PRODUCT_ID,
+      productName: product.name,
+      priceInCents,
+      priceFormatted,
+      currency,
+    }
+  } catch (error) {
+    console.error('[Stripe] Failed to fetch product details:', error)
+    // Return defaults on error
+    return {
+      productId: STRIPE_PRODUCT_ID,
+      productName: 'Pine Script Publishing',
+      priceInCents: DEFAULT_PRICE_CENTS,
+      priceFormatted: '$1.00',
+      currency: 'usd',
+    }
+  }
+}

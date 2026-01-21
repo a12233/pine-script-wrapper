@@ -3,7 +3,7 @@ import { useState, useEffect, useRef } from 'react'
 import { createServerFn } from '@tanstack/react-start'
 import { runValidationLoop, type ValidationLoopResult } from '../server/validation-loop'
 import { hashScript, createPublishJob, generateUserId } from '../server/kv'
-import { createCheckoutSession } from '../server/stripe'
+import { createCheckoutSession, getProductDetails, type ProductDetails } from '../server/stripe'
 
 interface ValidationState {
   script: string
@@ -17,6 +17,12 @@ interface ValidationState {
 const validateScript = createServerFn()
   .handler(async (ctx: { data: { script: string } }) => {
     return runValidationLoop(ctx.data.script, 1) // 1 retry max
+  })
+
+// Server function to fetch product details from Stripe
+const fetchProductDetails = createServerFn()
+  .handler(async () => {
+    return getProductDetails()
   })
 
 // Server function to create checkout session
@@ -65,6 +71,7 @@ function ValidatePage() {
   const [description, setDescription] = useState('')
   const [visibility, setVisibility] = useState<'public' | 'private'>('public')
   const [isCreatingCheckout, setIsCreatingCheckout] = useState(false)
+  const [productDetails, setProductDetails] = useState<ProductDetails | null>(null)
 
   // Load script from session storage on mount
   // Use ref to prevent double validation in React StrictMode
@@ -86,6 +93,11 @@ function ValidatePage() {
       navigate({ to: '/' })
     }
   }, [navigate])
+
+  // Fetch product details from Stripe on mount
+  useEffect(() => {
+    fetchProductDetails().then(setProductDetails).catch(console.error)
+  }, [])
 
   const runValidation = async (script: string) => {
     setState((s) => ({ ...s, status: 'validating' }))
@@ -242,7 +254,7 @@ function ValidatePage() {
           {state.result.isValid && (
             <div className="card">
               <div className="card-header">
-                <h2>Publish Your Indicator</h2>
+                <h2>{productDetails?.productName ?? 'Publish Your Indicator'}</h2>
               </div>
 
               <div className="form-group">
@@ -298,7 +310,7 @@ function ValidatePage() {
               </div>
 
               <div className="price-info">
-                <span className="price">$9.99</span>
+                <span className="price">{productDetails?.priceFormatted ?? '...'}</span>
                 <span className="price-desc">One-time payment to publish</span>
               </div>
 
