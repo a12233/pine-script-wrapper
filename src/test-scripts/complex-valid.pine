@@ -1,0 +1,372 @@
+//@version=6
+indicator("Rachel Decision System v1.0  (Trend + US10Y + Collar) + Structural Light + Auto-Structure v1.3", overlay=true, max_bars_back=600)
+
+//----------------------------------------------------
+// 一、技术面：价格趋势（20/50MA + Supertrend）
+//----------------------------------------------------
+lenFast   = input.int(20, "短期均线 (MA20)")
+lenSlow   = input.int(50, "中期均线 (MA50)")
+stAtrLen  = input.int(10, "Supertrend ATR 长度")
+stFactor  = input.float(3.0, "Supertrend 倍数")
+
+showBg         = input.bool(true, "显示趋势/结构背景色")
+showMarks      = input.bool(true, "显示 ALL-OUT 标签")
+showTable      = input.bool(true, "显示右上角决策面板")
+showUs10yPlot  = input.bool(false, "可选：在图上画 US10Y（右轴）")
+
+// MA & Supertrend
+maFast = ta.sma(close, lenFast)
+maSlow = ta.sma(close, lenSlow)
+[stValue, stDir] = ta.supertrend(stFactor, stAtrLen)
+
+// 趋势状态枚举
+var int STRONG     = 1
+var int WEAK       = 2
+var int REVERSAL   = 3
+var int STRUCT     = 4
+var int NEUTRAL    = 0
+
+isStrong   = close > maFast and maFast > maSlow and stDir == 1
+isWeak     = close < maFast and close >= maSlow and stDir == 1
+isReversal = stDir == -1 and close >= maSlow
+isStruct   = stDir == -1 and close < maSlow
+
+trend =
+     isStrong   ? STRONG  :
+     isWeak     ? WEAK    :
+     isStruct   ? STRUCT  :
+     isReversal ? REVERSAL:
+                  NEUTRAL
+
+// 画 MA & Supertrend
+plot(maFast, "MA20", color=color.new(color.teal, 0), linewidth=2)
+plot(maSlow, "MA50", color=color.new(color.orange, 0), linewidth=2)
+plot(stValue, "Supertrend", color = stDir == 1 ? color.new(color.green, 0) : color.new(color.red, 0), linewidth=2)
+
+//----------------------------------------------------
+// ✅ 二、结构灯（人工结构区：你手工输入 405/410 等）
+//----------------------------------------------------
+structure_low  = input.float(960.0, "Manual Structure Low（人工结构下沿）",  step=0.5)
+structure_high = input.float(980.0, "Manual Structure High（人工结构上沿）", step=0.5)
+
+// 0=RED 1=YELLOW 2=GREEN
+// RED: 收盘 < 下沿
+// GREEN: 收盘 >= 上沿 且 收盘 > MA20（更稳）
+// YELLOW: 其它（含：站回MA20但仍未回结构）
+m_isRed   = close < structure_low
+m_isGreen = close >= structure_high and close > maFast
+m_state   = m_isRed ? 0 : m_isGreen ? 2 : 1
+
+m_text =m_state == 0 ? "Manual Struct: RED（跌破结构下沿）" : m_state == 1 ? "Manual Struct: YELLOW（修复尝试/反抽）" :"Manual Struct: GREEN（回归结构区上沿）"
+
+//----------------------------------------------------
+// ✅ 三、Auto-Structure v1.3（Pivot 结构区 + 接受度评分 + fallback）
+//----------------------------------------------------
+as3_left        = input.int(3,   "AS v1.3: Pivot Left",  minval=1)
+as3_right       = input.int(3,   "AS v1.3: Pivot Right", minval=1)
+as3_pivotLookbk = input.int(120, "AS v1.3: Pivot有效回看", minval=30)
+as3_maxZonePct  = input.float(0.08, "AS v1.3: 最大箱体宽度(%)", step=0.01) // GLD 常用 0.06~0.08
+
+as3_win         = input.int(10,  "AS v1.3: 接受度统计窗口", minval=5)
+as3_rejBandPct  = input.float(0.25, "AS v1.3: 上沿拒绝带宽(占区间%)", step=0.05)
+as3_wickRatio   = input.float(1.6,  "AS v1.3: 上影倍数阈值", step=0.1)
+as3_volMult     = input.float(1.2,  "AS v1.3: 放量阈值(相对均量)", step=0.1)
+as3_retestBars  = input.int(8,   "AS v1.3: 跌破后回抽观察K线数", minval=3)
+
+as3_showZone    = input.bool(false, "AS v1.3: 显示 Pivot 结构区")
+
+// Pivot 识别
+pL = ta.pivotlow(low,  as3_left, as3_right)
+pH = ta.pivothigh(high, as3_left, as3_right)
+
+var float lastPL = na
+var int   lastPL_i = na
+var float lastPH = na
+var int   lastPH_i = na
+
+if not na(pL)
+    lastPL   := pL
+    lastPL_i := bar_index - as3_right
+
+if not na(pH)
+    lastPH   := pH
+    lastPH_i := bar_index - as3_right
+
+// fallback：防 pivot 未稳定导致箱体不可用
+as3_fbLow  = ta.lowest(low,  50)
+as3_fbHigh = ta.highest(high, 50)
+
+pivotBothReady = not na(lastPL) and not na(lastPH)
+pivotFresh     = pivotBothReady and (bar_index - lastPL_i <= as3_pivotLookbk) and (bar_index - lastPH_i <= as3_pivotLookbk)
+
+candLow   = pivotFresh ? math.min(lastPL, lastPH) : na
+candHigh  = pivotFresh ? math.max(lastPL, lastPH) : na
+candRange = pivotFresh ? math.max(candHigh - candLow, syminfo.mintick) : na
+candMid   = pivotFresh ? (candHigh + candLow) / 2 : na
+
+candTooWide = pivotFresh ? (candRange / candMid) > as3_maxZonePct : true
+
+as3_low   = (pivotFresh and not candTooWide) ? candLow  : as3_fbLow
+as3_high  = (pivotFresh and not candTooWide) ? candHigh : as3_fbHigh
+as3_range = math.max(as3_high - as3_low, syminfo.mintick)
+as3_mid   = (as3_high + as3_low) / 2
+
+// 接受度：收盘是否在区间内
+as3_inZone = close >= as3_low and close <= as3_high
+
+// 上沿拒绝带
+as3_rejBandLow = as3_high - as3_range * as3_rejBandPct
+as3_nearTop    = close >= as3_rejBandLow
+
+// 上影 + 放量拒绝
+as3_body    = math.abs(close - open)
+as3_upperW  = high - math.max(open, close)
+as3_bodyAdj = math.max(as3_body, syminfo.mintick)
+
+as3_volMA    = ta.sma(volume, 20)
+as3_isBigVol = volume > as3_volMA * as3_volMult
+
+as3_rejectCandle = as3_nearTop and as3_upperW > as3_bodyAdj * as3_wickRatio and as3_isBigVol
+
+// 统计
+as3_zoneCount = ta.sum(as3_inZone ? 1 : 0, as3_win)
+as3_rejCount  = ta.sum(as3_rejectCandle ? 1 : 0, as3_win)
+
+// 跌破下沿（收盘确认） + 回归失败（跌破后 N 根内最高收盘都没回到 mid）
+as3_breakDn        = ta.crossunder(close, as3_low)
+as3_sinceBreak     = ta.barssince(as3_breakDn)
+as3_inRetestWindow = as3_sinceBreak >= 0 and as3_sinceBreak <= as3_retestBars
+as3_failReclaimMid = as3_inRetestWindow and ta.highest(close, as3_sinceBreak + 1) < as3_mid
+
+// 评分（0~100）
+as3_score_zone = (as3_zoneCount / as3_win) * 60.0
+as3_score_mid  = close > as3_mid ? 20.0 : 0.0
+as3_pen_rej    = math.min(as3_rejCount * 10.0, 30.0)
+as3_pen_fail   = as3_failReclaimMid ? 30.0 : 0.0
+
+as3_score_raw  = as3_score_zone + as3_score_mid - as3_pen_rej - as3_pen_fail
+as3_score      = math.max(math.min(as3_score_raw, 100.0), 0.0)
+
+// Auto-Structure 三态：0=REJECTED 1=UNSTABLE 2=ACCEPTED
+as3_REJECTED = as3_score < 35 or close < as3_low
+as3_ACCEPTED = as3_score >= 65 and close > as3_mid
+as3_UNSTABLE = not as3_REJECTED and not as3_ACCEPTED
+
+as3_state = as3_REJECTED ? 0 : as3_UNSTABLE ? 1 :2
+
+as3_text =
+     as3_state == 2 ? "Auto-Struct v1.3: ACCEPTED (" + str.tostring(as3_score, "#") + ")" :
+     as3_state == 1 ? "Auto-Struct v1.3: UNSTABLE (" + str.tostring(as3_score, "#") + ")" :
+                      "Auto-Struct v1.3: REJECTED (" + str.tostring(as3_score, "#") + ")"
+
+// （可选）画出 Auto-Structure 区间
+plot(as3_showZone ? as3_low  : na, "AS3 Low",  color=color.new(color.red, 35), linewidth=1)
+plot(as3_showZone ? as3_mid  : na, "AS3 Mid",  color=color.new(color.gray, 55), linewidth=1)
+plot(as3_showZone ? as3_high : na, "AS3 High", color=color.new(color.green, 35), linewidth=1)
+
+//----------------------------------------------------
+// ✅ 四、最终结构状态（取更保守：人工结构 vs 自动结构）
+//----------------------------------------------------
+finalStructState = math.min(m_state, as3_state)
+
+finalStructText =
+     finalStructState == 0 ? "FINAL Struct: RED（破坏优先）" :
+     finalStructState == 1 ? "FINAL Struct: YELLOW（修复尝试）" :
+                             "FINAL Struct: GREEN（修复完成）"
+
+//----------------------------------------------------
+// 背景色：趋势色（原）+ 结构优先覆盖
+//----------------------------------------------------
+trendBgRaw =
+     trend == STRONG   ? color.new(color.green, 90)  :
+     trend == WEAK     ? color.new(color.yellow, 88) :
+     trend == REVERSAL ? color.new(color.orange, 88) :
+     trend == STRUCT   ? color.new(color.red, 88)    :
+                         color.new(color.gray, 92)
+
+// 结构优先覆盖：RED > YELLOW > 原趋势背景
+finalBg =
+     finalStructState == 0 ? color.new(color.red, 86) :
+     finalStructState == 1 ? color.new(color.orange, 88) :
+                             trendBgRaw
+
+bgcolor(showBg ? finalBg : na, title="Final Trend/Struct Background")
+
+//----------------------------------------------------
+// 五、宏观面：US10Y Risk-ON / OFF
+//----------------------------------------------------
+tfYield        = input.timeframe("D", "US10Y 使用周期")
+lenFastYield   = input.int(10, "US10Y 短期均线")
+lenSlowYield   = input.int(30, "US10Y 中期均线")
+slopeLookbackY = input.int(5,  "US10Y 斜率回看")
+
+us10y   = request.security("US10Y", tfYield, close)
+fastY   = ta.ema(us10y, lenFastYield)
+slowY   = ta.ema(us10y, lenSlowYield)
+slopeY  = fastY - fastY[slopeLookbackY]
+
+isRiskOn  = (us10y < slowY) and (slopeY < 0)
+isRiskOff = (us10y > slowY) and (slopeY > 0)
+
+macroText =
+     isRiskOn  ? "Risk-ON（利率下行/偏利好风险资产）" :
+     isRiskOff ? "Risk-OFF（利率上行/压制风险资产）" :
+                 "中性 Neutral"
+
+plot(showUs10yPlot ? us10y : na, "US10Y Yield", color=color.new(color.yellow, 0), linewidth=1)
+
+//----------------------------------------------------
+// 六、仓位 & Collar 决策逻辑（宏观 + 技术 双因子）
+//----------------------------------------------------
+trendText =
+     trend == STRONG   ? "强趋势 Strong"      :
+     trend == WEAK     ? "趋势走弱 Weak"      :
+     trend == REVERSAL ? "反转 Reversal"      :
+     trend == STRUCT   ? "结构破坏 Structural":
+                         "中性 Neutral"
+
+string trendPos      = ""
+string corePos       = ""
+string collarAdvice  = ""
+
+// 先按原逻辑生成建议
+if isRiskOn
+    if trend == STRONG
+        trendPos     := "+20% 加仓（趋势仓）"
+        corePos      := "核心仓：正常持有"
+        collarAdvice := "无需 Collar"
+    else if trend == WEAK
+        trendPos     := "−10% 减仓（趋势仓）"
+        corePos      := "核心仓：不加仓，观察"
+        collarAdvice := "一般不需要 Collar"
+    else if trend == REVERSAL
+        trendPos     := "−30% 减仓（趋势仓）"
+        corePos      := "核心仓：可考虑轻度 Collar"
+        collarAdvice := "可选轻度 Collar（技术反转，但宏观仍友好）"
+    else if trend == STRUCT
+        trendPos     := "清空趋势仓 / ALL-OUT"
+        corePos      := "核心仓：减仓约 10%，关注风险"
+        collarAdvice := "建议防守型 Collar"
+    else
+        trendPos     := "趋势仓：轻仓/观望"
+        corePos      := "核心仓：正常持有或小幅调整"
+        collarAdvice := "一般不需要 Collar"
+
+else if isRiskOff
+    if trend == STRONG
+        trendPos     := "不追高，必要时减仓"
+        corePos      := "核心仓：持有但提高警惕"
+        collarAdvice := "可选防守 Collar（宏观偏紧）"
+    else if trend == WEAK
+        trendPos     := "−20% 减仓（趋势仓）"
+        corePos      := "核心仓：暂停加仓"
+        collarAdvice := "建议防守 Collar（宏观 + 技术走弱）"
+    else if trend == REVERSAL
+        trendPos     := "−50% 或更多减仓（趋势仓）"
+        corePos      := "核心仓：减仓约 10%，加强对冲"
+        collarAdvice := "必须 Collar（利率上行 + 技术反转）"
+    else if trend == STRUCT
+        trendPos     := "趋势仓：ALL-OUT 全部卖出"
+        corePos      := "核心仓：减仓约 20%，优先防守"
+        collarAdvice := "强制 Collar 或等价对冲（最差组合）"
+    else
+        trendPos     := "趋势仓：低仓位、防守"
+        corePos      := "核心仓：谨慎观望"
+        collarAdvice := "偏建议 Collar"
+
+else
+    if trend == STRONG
+        trendPos     := "+10–20% 加仓（看个人风险偏好）"
+        corePos      := "核心仓：正常持有"
+        collarAdvice := "一般不需要 Collar"
+    else if trend == WEAK
+        trendPos     := "−10% 减仓或不动"
+        corePos      := "核心仓：不追高"
+        collarAdvice := "可选轻度 Collar（视个体风险）"
+    else if trend == REVERSAL
+        trendPos     := "−30% 减仓（趋势仓）"
+        corePos      := "核心仓：考虑轻 Collar"
+        collarAdvice := "建议轻度 Collar（技术不好，宏观中性）"
+    else if trend == STRUCT
+        trendPos     := "大幅减仓 / 准 ALL-OUT"
+        corePos      := "核心仓：减仓 10–15%"
+        collarAdvice := "建议防守 Collar"
+    else
+        trendPos     := "趋势仓：轻仓/等待"
+        corePos      := "核心仓：耐心等待趋势"
+        collarAdvice := "Collar 视个人风险，可有可无"
+
+//----------------------------------------------------
+// ✅ 七、结构优先 Gate（硬规则：finalStructState）
+//----------------------------------------------------
+if finalStructState == 0
+    trendPos     := "趋势仓：ALL-OUT / 禁止做多"
+    corePos      := isRiskOff ? "核心仓：优先防守，建议减仓 15–25%" : "核心仓：优先防守，建议减仓 10–15%"
+    collarAdvice := "强烈建议防守型 Collar / 等价对冲（结构RED优先）"
+else if finalStructState == 1
+    if trendPos == "+20% 加仓（趋势仓）" or trendPos == "+10–20% 加仓（看个人风险偏好）"
+        trendPos := "趋势仓：不追，观察修复（YELLOW 不加仓）"
+    if collarAdvice == "无需 Collar"
+        collarAdvice := "一般不需要 Collar，但保持警惕（YELLOW）"
+
+//----------------------------------------------------
+// 八、ALL-OUT 标签（结构RED + 风险OFF）
+//----------------------------------------------------
+trendAllOut     = (isRiskOff and finalStructState == 0)
+trendAllOutNow  = trendAllOut and not trendAllOut[1]
+
+if showMarks and trendAllOutNow
+    label.new(bar_index, high, "ALL-OUT",
+              style=label.style_label_down,
+              color=color.red,
+              textcolor=color.white)
+
+//----------------------------------------------------
+// 九、右上角决策面板（8 行）
+//----------------------------------------------------
+var table panel = table.new(position.top_right, 1, 8, border_width=1)
+
+if barstate.islast and showTable
+    // 0: ticker
+    table.cell(panel, 0, 0, syminfo.ticker,
+               text_color=color.white,
+               bgcolor=color.black)
+
+    // 1: macro
+    table.cell(panel, 0, 1, macroText,
+               text_color=color.white,
+               bgcolor=color.new(color.navy, 80))
+
+    // 2: FINAL struct
+    table.cell(panel, 0, 2, finalStructText,
+               text_color=color.white,
+               bgcolor=finalStructState == 0 ? color.new(color.red, 80) :
+                      finalStructState == 1 ? color.new(color.orange, 80) :
+                                              color.new(color.green, 80))
+
+    // 3: Auto-Structure v1.3 detail
+    table.cell(panel, 0, 3, as3_text,
+               text_color=color.white,
+               bgcolor=as3_state == 0 ? color.new(color.red, 80) :
+                      as3_state == 1 ? color.new(color.orange, 80) :
+                                       color.new(color.green, 80))
+
+    // 4: trend state
+    table.cell(panel, 0, 4, trendText,
+               text_color=color.white,
+               bgcolor=trendBgRaw)
+
+    // 5: trend position
+    table.cell(panel, 0, 5, "趋势仓: " + trendPos,
+               text_color=color.white,
+               bgcolor=color.new(color.blue, 85))
+
+    // 6: core position
+    table.cell(panel, 0, 6, "核心仓: " + corePos,
+               text_color=color.white,
+               bgcolor=color.new(color.purple, 85))
+
+    // 7: collar
+    table.cell(panel, 0, 7, "Collar: " + collarAdvice,
+               text_color=color.white,
+               bgcolor=color.new(color.maroon, 80))
