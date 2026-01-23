@@ -200,6 +200,7 @@ async function runValidationLoopInternal(
       }
     }
 
+    console.log(`[ValidationLoop:${requestId}] publishOptions from caller:`, JSON.stringify(publishOptions))
     const combinedResult = await validateAndPublishPineScript(credentials, currentScript, {
       title: publishOptions.title,
       description: publishOptions.description,

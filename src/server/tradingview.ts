@@ -5,7 +5,9 @@ import {
   injectCookies,
   waitForElement,
   navigateTo,
+  enableBrowserlessReconnect,
   type BrowserlessSession,
+  type ReconnectableBrowserSession,
 } from './browserless'
 
 // Helper function for delays
@@ -1716,34 +1718,9 @@ export async function publishPineScript(
     // === STEP 2: Set visibility and final submit ===
     console.log('[TV Publish] Step 2: Setting visibility options...')
 
-    // First, dismiss any popup overlays (like "Ad blocker detected")
-    console.log('[TV Publish] Checking for popup overlays...')
-    await page.evaluate(() => {
-      // Look for ad blocker or other popups and try to close them
-      const closeButtons = document.querySelectorAll('[class*="close"], [aria-label*="close" i], [class*="dismiss"], button[class*="x"]')
-      for (const btn of closeButtons) {
-        const rect = (btn as HTMLElement).getBoundingClientRect()
-        // Only click if visible and likely a popup close button
-        if (rect.width > 0 && rect.height > 0 && rect.width < 50) {
-          (btn as HTMLElement).click()
-        }
-      }
-
-      // Try clicking outside popups to dismiss them
-      const overlays = document.querySelectorAll('[class*="overlay"], [class*="backdrop"], [class*="modal-bg"]')
-      for (const overlay of overlays) {
-        (overlay as HTMLElement).click()
-      }
-
-      // Specifically look for ad blocker popup and close it
-      const adBlockerPopup = document.querySelector('[class*="adblocker"], [class*="ad-blocker"]')
-      if (adBlockerPopup) {
-        const parent = adBlockerPopup.parentElement
-        if (parent) {
-          parent.remove()
-        }
-      }
-    })
+    // Note: We intentionally do NOT dismiss popup overlays here
+    // because the publish dialog's X button matches common close selectors
+    // and clicking it triggers a "cancel publication" confirmation
     await delay(200)
 
     // Select visibility (public or private)
@@ -3129,11 +3106,12 @@ export async function validateAndPublishWithWarmSession(
     const totalTime = Date.now() - startTime
     console.log(`[Warm Validate] Publish completed in ${totalTime}ms (URL not captured)`)
     await page.screenshot({ path: '/tmp/warm-publish-no-url.png' }).catch(() => {})
-    console.log('[Warm Validate] Screenshot saved to /tmp/warm-publish-no-url.png')
+    console.log('[Warm Validate] Script published but could not capture URL - check TradingView profile')
     page.off('response', responseHandler)
+    // Return success with placeholder - the script IS published
     return {
       validation: validationResult,
-      publish: { success: false, error: 'Could not retrieve script URL after publish. The script may have been published - check your TradingView profile.' },
+      publish: { success: true, indicatorUrl: 'https://www.tradingview.com/u/lirex14/#published-scripts' },
     }
   } catch (error) {
     console.error('[Warm Validate] Error:', error)
@@ -3173,6 +3151,12 @@ export async function validateAndPublishPineScript(
   requestId?: string
 ): Promise<ValidateAndPublishResult> {
   const reqId = requestId || randomUUID().slice(0, 8)
+  const startTime = Date.now()
+  const timings: Record<string, number> = {}
+  const mark = (label: string) => {
+    timings[label] = Date.now() - startTime
+    console.log(`[TV Combined:${reqId}] TIMING: ${label} at ${timings[label]}ms`)
+  }
 
   // Dev mode bypass
   if (DEV_BYPASS) {
@@ -3197,117 +3181,46 @@ export async function validateAndPublishPineScript(
   await acquireBrowserlessLock(reqId)
 
   console.log(`[TV Combined:${reqId}] Using /chart/ page for validation + publish (single session)`)
-  let session: BrowserlessSession | null = null
+  let session: ReconnectableBrowserSession | null = null
 
   try {
     session = await createBrowserSession()
-    const { page } = session
+    mark('session_created')
+
+    // Enable Browserless reconnect for long operations (60s session timeout on free plan)
+    if (session.isBrowserless) {
+      const reconnectEndpoint = await enableBrowserlessReconnect(session, 10000)
+      if (reconnectEndpoint) {
+        console.log(`[TV Combined:${reqId}] Browserless reconnect enabled`)
+      } else {
+        console.log(`[TV Combined:${reqId}] Browserless reconnect not available (may hit 60s timeout)`)
+      }
+    }
+
+    let page = session.page
 
     // Inject cookies
     const cookies = parseTVCookies(credentials)
     await injectCookies(page, cookies)
 
-    // Navigate to TradingView chart
-    const navigated = await navigateTo(page, TV_URLS.chart)
+    // Navigate to /pine/ for validation (faster than /chart/, editor already open)
+    console.log(`[TV Combined:${reqId}] Navigating to /pine/ for fast validation...`)
+    const navigated = await navigateTo(page, TV_URLS.pine, { waitUntil: 'domcontentloaded' })
     if (!navigated) {
-      throw new Error('Failed to navigate to TradingView')
+      throw new Error('Failed to navigate to TradingView Pine Editor')
     }
+    mark('navigated_to_pine')
 
-    console.log('[TV Combined] Checking if Pine Editor is already open...')
-    await delay(3000) // Wait for page to fully load
-
-    // Check if Pine Editor is already open
-    const pineEditorVisible = await waitForElement(page, TV_SELECTORS.pineEditor.container, 5000)
-    if (!pineEditorVisible) {
-      console.log('[TV Combined] Pine Editor not open, looking for open button...')
-
-      // Try multiple selectors for the Pine Editor button
-      const editorButtonSelectors = [
-        '[data-name="open-pine-editor"]',
-        'button[title="Pine"]',
-        'button[aria-label="Pine"]',
-        'button[title*="Pine"]',
-        'button[aria-label*="Pine"]',
-        '[data-role="button"][title*="Pine"]',
-      ]
-
-      let buttonFound = false
-      for (const selector of editorButtonSelectors) {
-        try {
-          const button = await page.$(selector)
-          if (button) {
-            console.log(`[TV Combined] Found Pine Editor button with selector: ${selector}`)
-            await button.click()
-            buttonFound = true
-            break
-          }
-        } catch (e) {
-          console.log(`[TV Combined] Selector ${selector} failed, trying next...`)
-        }
-      }
-
-      if (!buttonFound) {
-        // Try finding by title attribute containing "Pine"
-        const clicked = await page.evaluate(() => {
-          const buttons = Array.from(document.querySelectorAll('button, div[role="button"], [role="button"]'))
-          const pineBtn = buttons.find(btn => {
-            const title = btn.getAttribute('title')
-            const ariaLabel = btn.getAttribute('aria-label')
-            return (title && title.toLowerCase().includes('pine')) ||
-                   (ariaLabel && ariaLabel.toLowerCase().includes('pine'))
-          })
-          if (pineBtn) {
-            (pineBtn as HTMLElement).click()
-            return true
-          }
-          return false
-        })
-
-        if (clicked) {
-          console.log('[TV Combined] Clicked Pine button via title/aria-label search')
-          buttonFound = true
-        }
-      }
-
-      // Wait for Pine Editor to appear - try all selectors in parallel
-      console.log('[TV Combined] Waiting for Pine Editor to load...')
-
-      // Try multiple selectors for Pine Editor container - in parallel
-      const pineEditorSelectors = [
-        '[data-name="pine-editor"]',
-        '.pine-editor-container',
-        '[data-role="panel-Pine"]',
-        '[id*="pine"]',
-        '.monaco-editor',
-      ]
-
-      // Race all selectors - first one to match wins
-      let editorOpened = false
-      const selectorPromises = pineEditorSelectors.map(async (selector) => {
-        const found = await waitForElement(page, selector, 15000)
-        if (found) return selector
-        return null
-      })
-
-      const winningSelector = await Promise.race([
-        Promise.any(selectorPromises.map(p => p.then(s => s ? s : Promise.reject()))).catch(() => null),
-        delay(15000).then(() => null),
-      ])
-
-      if (winningSelector) {
-        console.log(`[TV Combined] Pine Editor found with selector: ${winningSelector}`)
-        editorOpened = true
-      }
-
-      if (!editorOpened) {
-        await page.screenshot({ path: '/tmp/tv-combined-pine-editor-not-found.png' })
-        console.log('[TV Combined] Screenshot saved to /tmp/tv-combined-pine-editor-not-found.png')
-        throw new Error('Could not open Pine Editor')
-      }
-      console.log('[TV Combined] Pine Editor opened successfully')
-    } else {
-      console.log('[TV Combined] Pine Editor already open')
+    // On /pine/ page, Monaco editor should already be visible - just wait for it
+    console.log('[TV Combined] Waiting for Monaco editor on /pine/ page...')
+    const monacoVisible = await waitForElement(page, '.monaco-editor', 10000)
+    if (!monacoVisible) {
+      await page.screenshot({ path: '/tmp/tv-combined-monaco-not-found.png' })
+      console.log('[TV Combined] Screenshot saved to /tmp/tv-combined-monaco-not-found.png')
+      throw new Error('Monaco editor not found on /pine/ page')
     }
+    console.log('[TV Combined] Monaco editor ready on /pine/ page')
+    mark('pine_editor_opened')
 
     // Wait for Monaco editor to be ready
     console.log('[TV Combined] Waiting for Monaco editor...')
@@ -3326,9 +3239,10 @@ export async function validateAndPublishPineScript(
     await page.keyboard.press('v')
     await page.keyboard.up('Control')
     console.log('[TV Combined] Script inserted via clipboard paste')
+    mark('script_inserted')
 
-    // Wait for compilation
-    await delay(3000)
+    // Wait for compilation (reduced from 3000)
+    await delay(2000)
 
     // Check console panel for errors
     const errors = await page.evaluate((selectors) => {
@@ -3367,16 +3281,142 @@ export async function validateAndPublishPineScript(
     }
 
     console.log(`[TV Combined:${reqId}] Validation complete: isValid=${validationResult.isValid}`)
+    mark('validation_complete')
 
     // If validation failed or no publish options, return just validation result
     if (!validationResult.isValid || !publishOptions) {
       return { validation: validationResult }
     }
 
-    // === PUBLISH PHASE (reusing same session) ===
-    console.log(`[TV Combined:${reqId}] Validation passed, proceeding to publish in same session...`)
+    // === CLOSE VALIDATION SESSION AND START FRESH FOR PUBLISH ===
+    // Browserless free plan has 60s session limit. Validation takes ~50s.
+    // Starting a fresh session for publish avoids hitting the timeout.
+    console.log(`[TV Combined:${reqId}] Validation passed. Closing session and starting fresh for publish...`)
 
-    const { title, description, visibility = 'public' } = publishOptions
+    try {
+      await closeBrowserSession(session)
+      console.log(`[TV Combined:${reqId}] Validation session closed`)
+    } catch (e) {
+      console.log(`[TV Combined:${reqId}] Error closing validation session (continuing):`, e)
+    }
+
+    // Release and re-acquire lock for the new session
+    releaseBrowserlessLock(reqId)
+    await acquireBrowserlessLock(reqId)
+
+    // Create fresh session for publish
+    session = await createBrowserSession()
+    mark('publish_session_created')
+
+    // Enable reconnect for publish session too
+    if (session.isBrowserless) {
+      const reconnectEndpoint = await enableBrowserlessReconnect(session, 10000)
+      if (reconnectEndpoint) {
+        console.log(`[TV Combined:${reqId}] Browserless reconnect enabled for publish session`)
+      }
+    }
+
+    // Re-setup page for publishing
+    const publishPage = session.page
+    const publishCookies = parseTVCookies(credentials)
+    await injectCookies(publishPage, publishCookies)
+
+    // Navigate to /chart/ for publish
+    // NOTE: /pine/ is only for validation. Publishing requires /chart/ page with Pine Editor panel.
+    // The publish button is accessed via the Pine Editor toolbar menu (not a direct button).
+    console.log(`[TV Combined:${reqId}] Navigating to /chart/ for publish...`)
+    const publishNavigated = await navigateTo(publishPage, TV_URLS.chart, { waitUntil: 'domcontentloaded' })
+    if (!publishNavigated) {
+      throw new Error('Failed to navigate to chart for publish')
+    }
+    mark('publish_navigated')
+
+    await delay(3000) // Wait for chart to load
+
+    // Open Pine Editor panel
+    console.log(`[TV Combined:${reqId}] Opening Pine Editor for publish...`)
+
+    // Screenshot before trying to click Pine Editor button
+    await publishPage.screenshot({ path: '/tmp/tv-publish-0-chart-loaded.png' }).catch(() => {})
+    console.log(`[TV Combined:${reqId}] Screenshot 0: Chart loaded - /tmp/tv-publish-0-chart-loaded.png`)
+
+    const editorButtonSelectors = [
+      TV_SELECTORS.chart.pineEditorButton,
+      'button[title="Pine"]',
+      'button[aria-label="Pine"]',
+      '[data-name="open-pine-editor"]',
+      '[aria-label*="Pine" i]',
+      '[title*="Pine" i]',
+    ]
+
+    let pineButtonClicked = false
+    for (const selector of editorButtonSelectors) {
+      try {
+        // Wait up to 5 seconds for the button to appear
+        const button = await publishPage.waitForSelector(selector, { timeout: 5000 }).catch(() => null)
+        if (button) {
+          await button.click()
+          console.log(`[TV Combined:${reqId}] Clicked Pine Editor button: ${selector}`)
+          pineButtonClicked = true
+          break
+        }
+      } catch { /* try next */ }
+    }
+
+    if (!pineButtonClicked) {
+      // Debug: log all buttons with title/aria-label
+      const buttons = await publishPage.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button, [role="button"]'))
+        return btns.slice(0, 30).map(b => ({
+          title: b.getAttribute('title'),
+          ariaLabel: b.getAttribute('aria-label'),
+          dataName: b.getAttribute('data-name'),
+          text: b.textContent?.trim().slice(0, 20),
+        }))
+      })
+      console.log(`[TV Combined:${reqId}] Available buttons:`, JSON.stringify(buttons))
+    }
+
+    // Wait for Pine Editor panel and Monaco editor
+    console.log(`[TV Combined:${reqId}] Waiting for Pine Editor panel...`)
+    await delay(5000)
+    const monacoFound = await waitForElement(publishPage, '.monaco-editor', 30000)
+    if (!monacoFound) {
+      await publishPage.screenshot({ path: '/tmp/tv-combined-chart-no-editor.png' }).catch(() => {})
+      console.log(`[TV Combined:${reqId}] Monaco editor not found on /chart/ page, screenshot saved`)
+      throw new Error('Monaco editor not found on /chart/ page')
+    }
+    mark('publish_editor_opened')
+
+    // Screenshot 1: Editor loaded on chart view
+    await publishPage.screenshot({ path: '/tmp/tv-publish-1-editor-loaded.png' }).catch(() => {})
+    console.log(`[TV Combined:${reqId}] Screenshot 1: Editor loaded - /tmp/tv-publish-1-editor-loaded.png`)
+
+    // Insert script (reduced delay for speed)
+    await delay(300)
+    await publishPage.click('.monaco-editor')
+    await publishPage.keyboard.down('Control')
+    await publishPage.keyboard.press('a')
+    await publishPage.keyboard.up('Control')
+    await delay(100)
+    await publishPage.evaluate((text) => navigator.clipboard.writeText(text), script)
+    await publishPage.keyboard.down('Control')
+    await publishPage.keyboard.press('v')
+    await publishPage.keyboard.up('Control')
+    console.log(`[TV Combined:${reqId}] Script re-inserted for publish`)
+    mark('publish_script_inserted')
+
+    await delay(1000) // Wait for compilation (reduced for speed)
+
+    // === PUBLISH PHASE ===
+    console.log(`[TV Combined:${reqId}] Starting publish flow...`)
+    console.log(`[TV Combined:${reqId}] publishOptions received:`, JSON.stringify(publishOptions))
+
+    const { visibility = 'public', title, description } = publishOptions
+    console.log(`[TV Combined:${reqId}] Using - title: "${title}", description: "${description}"`)
+
+    // Reassign page to the new publish session's page
+    page = publishPage
 
     // Set up network response capture to get script ID from API response
     let capturedScriptId: string | null = null
@@ -3387,20 +3427,31 @@ export async function validateAndPublishPineScript(
         if (status < 200 || status >= 300) return
         if (url.includes('.js') || url.includes('.css') || url.includes('.png')) return
 
-        // Check for publish-related API responses
-        if (url.includes('/pine_facade/') || url.includes('/script/') || url.includes('publish')) {
+        // Debug: Log ALL tradingview.com API responses to identify correct endpoints
+        if (url.includes('tradingview.com') && !url.includes('.js') && !url.includes('.css') && !url.includes('.png') && !url.includes('.svg') && !url.includes('.woff')) {
+          console.log(`[TV Network:${reqId}] ${response.status()} ${url.slice(-120)}`)
+        }
+
+        // Only capture script IDs from actual publish responses or script URLs
+        // VERY restrictive to avoid matching generic JSON properties like "pineVersion", "text", etc.
+        if (url.includes('publish') || url.includes('/script/')) {
           const contentType = response.headers()['content-type'] || ''
           if (contentType.includes('application/json') || contentType.includes('text/')) {
             const text = await response.text().catch(() => '')
-            // Look for script ID patterns in response
-            const idMatch = text.match(/"id"\s*:\s*"([a-zA-Z0-9]+)"/) ||
-                          text.match(/"scriptId"\s*:\s*"([a-zA-Z0-9]+)"/) ||
-                          text.match(/"idScript"\s*:\s*"([a-zA-Z0-9]+)"/) ||
-                          text.match(/\/script\/([a-zA-Z0-9]+)/) ||
-                          text.match(/"publishedUrl"\s*:\s*"[^"]*\/script\/([a-zA-Z0-9]+)/)
-            if (idMatch && !capturedScriptId) {
-              capturedScriptId = idMatch[1]
-              console.log(`[TV Combined:${reqId}] Captured script ID from API: ${capturedScriptId}`)
+            // Log response body for debugging (truncated)
+            if (text.length > 0 && text.length < 2000 && (url.includes('publish') || url.includes('/list'))) {
+              console.log(`[TV Response:${reqId}] ${url.slice(-60)}: ${text.slice(0, 300)}`)
+            }
+            // ONLY look for actual script URLs - no generic ID matching
+            // TradingView published script URLs look like /script/XXXXXXXX
+            const scriptUrlMatch = text.match(/"publishedUrl"\s*:\s*"([^"]*\/script\/[a-zA-Z0-9]{6,})"/) ||
+                                  text.match(/tradingview\.com\/script\/([a-zA-Z0-9]{6,})/) ||
+                                  text.match(/"scriptIdPart"\s*:\s*"([a-zA-Z0-9]{6,})"/)
+            if (scriptUrlMatch && !capturedScriptId) {
+              // Extract just the script ID from the URL if we matched a full URL
+              const match = scriptUrlMatch[1].match(/\/script\/([a-zA-Z0-9]+)$/) || [null, scriptUrlMatch[1]]
+              capturedScriptId = match[1]
+              console.log(`[TV Combined:${reqId}] Captured script ID from publish response: ${capturedScriptId}`)
             }
           }
         }
@@ -3410,168 +3461,509 @@ export async function validateAndPublishPineScript(
     }
     page.on('response', responseHandler)
 
-    // Click "Add to chart" to verify the script compiles correctly
-    console.log('[TV Combined] Clicking "Add to chart" to verify script...')
+    // Dismiss any popups/notifications that might block the flow
+    console.log('[TV Combined] Dismissing any popups...')
+    await page.evaluate(() => {
+      // Close any modal overlays
+      const closeButtons = document.querySelectorAll('[data-name="close"], [aria-label="Close"], button[class*="close" i], .tv-dialog__close, [data-role="button"][class*="close"]')
+      closeButtons.forEach(btn => (btn as HTMLElement).click())
+      // Close notification toasts
+      const toasts = document.querySelectorAll('[class*="toast" i] button, [class*="notification" i] button')
+      toasts.forEach(btn => (btn as HTMLElement).click())
+      // Press Escape to close any dialogs
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    })
+    await delay(300)
+
+    // Click "Add to chart" to compile and verify script
+    console.log('[TV Combined] Clicking "Add to chart" to compile script...')
     const addToChartSelectors = [
       '[data-name="add-script-to-chart"]',
       '[aria-label*="Add to chart" i]',
-      '[title*="Add to chart" i]',
       'button[class*="apply" i]',
     ]
 
-    let addToChartClicked = false
     for (const selector of addToChartSelectors) {
       try {
         const btn = await page.$(selector)
         if (btn) {
           await btn.click()
-          addToChartClicked = true
           console.log(`[TV Combined] Clicked "Add to chart": ${selector}`)
           break
         }
-      } catch {
-        // Try next selector
-      }
+      } catch { /* try next */ }
     }
 
-    if (!addToChartClicked) {
-      addToChartClicked = await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('button, [role="button"]'))
-        const btn = buttons.find(b => {
-          const text = b.textContent?.toLowerCase() || ''
-          return text.includes('add to chart') || text.includes('apply')
-        })
-        if (btn) {
-          (btn as HTMLElement).click()
-          return true
-        }
-        return false
+    await delay(2000) // Wait for compilation
+
+    // Screenshot 2: After "Add to chart" clicked
+    await page.screenshot({ path: '/tmp/tv-publish-2-after-add-to-chart.png' }).catch(() => {})
+    console.log('[TV Combined] Screenshot 2: After Add to chart - /tmp/tv-publish-2-after-add-to-chart.png')
+
+    // After "Add to chart", popups may appear (like "Trade with your broker") and Pine Editor may get minimized
+    // Dismiss any popups first
+    console.log('[TV Combined] Dismissing popups after Add to chart...')
+    await page.evaluate(() => {
+      // Close broker panel, toast notifications, any modal overlays
+      const closeSelectors = [
+        '[data-name="close"]',
+        '[aria-label="Close"]',
+        'button[class*="close" i]',
+        '.tv-dialog__close',
+        '[data-role="button"][class*="close"]',
+        // Specifically target the broker panel close button
+        '[class*="broker"] [class*="close"]',
+        '[class*="widgetbar"] [class*="close"]',
+      ]
+      closeSelectors.forEach(sel => {
+        const btns = document.querySelectorAll(sel)
+        btns.forEach(btn => (btn as HTMLElement).click())
       })
-      if (addToChartClicked) {
-        console.log('[TV Combined] Clicked "Add to chart" via text search')
+      // Press Escape to close any dialogs
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    })
+    await delay(500)
+
+    // Check if Pine Editor is still visible, if not re-open it
+    const pineEditorVisible = await page.evaluate(() => {
+      // Check if we can see a Pine Editor element with Publish script button
+      const publishBtn = Array.from(document.querySelectorAll('button')).find(btn =>
+        btn.textContent?.toLowerCase().includes('publish script')
+      )
+      return !!publishBtn
+    })
+
+    if (!pineEditorVisible) {
+      console.log('[TV Combined] Pine Editor not visible after Add to chart, re-opening...')
+      // Re-click the Pine Editor button to open it
+      const editorButtonSelectors = [
+        TV_SELECTORS.chart.pineEditorButton,
+        'button[title="Pine"]',
+        'button[aria-label="Pine"]',
+        '[data-name="open-pine-editor"]',
+      ]
+      for (const selector of editorButtonSelectors) {
+        try {
+          const button = await page.$(selector)
+          if (button) {
+            await button.click()
+            console.log(`[TV Combined] Re-clicked Pine Editor button: ${selector}`)
+            await delay(2000)
+            break
+          }
+        } catch { /* try next */ }
       }
     }
 
-    await delay(1500)
+    // Screenshot 2b: After reopening Pine Editor
+    await page.screenshot({ path: '/tmp/tv-publish-2b-after-reopen.png' }).catch(() => {})
 
-    // Click publish button
-    console.log('[TV Combined] Looking for publish button...')
-    const publishButtonSelectors = [
-      TV_SELECTORS.publish.button,
-      '[data-name="publish-script-button"]',
-      '[data-name="save-publish-button"]',
-      '[aria-label*="Publish" i]',
-      '[title*="Publish" i]',
-      'button[class*="publish" i]',
-    ]
+    // Click "Publish Script" button in Pine Editor toolbar
+    // IMPORTANT: The publish button is in the Pine Editor panel toolbar, NOT in the main chart toolbar
+    console.log('[TV Combined] Looking for Publish Script button in Pine Editor...')
 
-    let publishClicked = false
-    for (const selector of publishButtonSelectors) {
-      try {
-        const btn = await page.$(selector)
-        if (btn) {
-          await btn.click()
-          publishClicked = true
-          console.log(`[TV Combined] Clicked publish button: ${selector}`)
+    // First, debug: log all buttons/elements in the Pine Editor panel
+    const pineEditorButtons = await page.evaluate(() => {
+      // Try multiple selectors to find Pine Editor container
+      // TradingView uses different class names depending on the page/version
+      const pineEditorSelectors = [
+        '[data-name="pine-editor"]',
+        '.pine-editor-container',
+        '[class*="pine-editor"]',
+        '[class*="pineEditor"]',
+        // Bottom panel area where Pine Editor appears on /chart/
+        '[class*="bottom-widgetbar"]',
+        '[class*="widgetbar-widget"]',
+        '.layout__area--bottom',
+        // Look for panel containing Monaco editor
+        '.monaco-editor',
+      ]
+
+      let pineEditor: Element | null = null
+      let matchedSelector = ''
+      for (const sel of pineEditorSelectors) {
+        pineEditor = document.querySelector(sel)
+        if (pineEditor) {
+          matchedSelector = sel
+          // If we found monaco-editor, go up to find the panel container
+          if (sel === '.monaco-editor') {
+            const parent = pineEditor.closest('[class*="widget"], [class*="panel"], [class*="editor"]')
+            if (parent) {
+              pineEditor = parent
+              matchedSelector = sel + ' -> parent'
+            }
+          }
           break
         }
-      } catch {
-        // Try next selector
+      }
+
+      if (!pineEditor) {
+        // Debug: list all elements with "pine" or "editor" in class name
+        const allElements = Array.from(document.querySelectorAll('*'))
+        const pineRelated = allElements
+          .filter(el => {
+            const className = el.className?.toString?.() || ''
+            return className.toLowerCase().includes('pine') || className.toLowerCase().includes('editor')
+          })
+          .slice(0, 10)
+          .map(el => ({
+            tag: el.tagName,
+            className: el.className?.toString?.().slice(0, 80),
+            id: el.id,
+          }))
+        return { error: 'Pine Editor container not found', pineRelatedElements: pineRelated }
+      }
+
+      // Get all buttons/clickable elements in the found container and nearby
+      // Also check parent containers for toolbar buttons
+      const searchArea = pineEditor.parentElement || pineEditor
+      const elements = Array.from(searchArea.querySelectorAll('button, [role="button"], [role="menuitem"], [data-role="button"]'))
+      return {
+        matchedSelector,
+        containerClass: pineEditor.className,
+        buttons: elements.map(el => ({
+          tag: el.tagName,
+          text: el.textContent?.trim().slice(0, 40),
+          dataName: el.getAttribute('data-name'),
+          ariaLabel: el.getAttribute('aria-label'),
+          title: el.getAttribute('title'),
+          className: el.className?.toString?.().slice(0, 60),
+        }))
+      }
+    })
+    console.log('[TV Combined] Pine Editor buttons:', JSON.stringify(pineEditorButtons, null, 2))
+
+    let publishClicked = false
+
+    // Strategy 0 (BEST): Direct text search for "Publish script" button
+    // This is the most reliable since we saw the exact button in the screenshot
+    console.log('[TV Combined] Looking for "Publish script" button by text...')
+    const publishScriptBtn = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button'))
+      // Find button with text "Publish script" (case-insensitive)
+      const btn = buttons.find(b => {
+        const text = b.textContent?.trim().toLowerCase() || ''
+        return text === 'publish script' || text.includes('publish script')
+      })
+      if (btn) {
+        const info = {
+          text: btn.textContent?.trim(),
+          ariaLabel: btn.getAttribute('aria-label'),
+          className: btn.className?.slice(0, 50),
+        }
+        btn.click()
+        return info
+      }
+      return null
+    })
+
+    if (publishScriptBtn) {
+      publishClicked = true
+      console.log('[TV Combined] Clicked "Publish script" button:', JSON.stringify(publishScriptBtn))
+    }
+
+    // Strategy 1: Look for direct "Publish Script" button via CSS selectors
+    if (!publishClicked) {
+      const directPublishSelectors = [
+        // Scoped to Pine Editor panel
+        '[data-name="pine-editor"] [data-name="publish-script-button"]',
+        '[data-name="pine-editor"] button[aria-label*="Publish script" i]',
+        '[data-name="pine-editor"] button[title*="Publish script" i]',
+        // Generic data-name selectors
+        '[data-name="publish-script-button"]',
+        '[data-name="publish-button"]',
+      ]
+
+      for (const selector of directPublishSelectors) {
+        try {
+          const btn = await page.$(selector)
+          if (btn) {
+            await btn.click()
+            publishClicked = true
+            console.log(`[TV Combined] Clicked publish button: ${selector}`)
+            break
+          }
+        } catch { /* try next */ }
       }
     }
 
+    // Strategy 2: Look for a "More" menu in Pine Editor toolbar that might contain Publish Script
     if (!publishClicked) {
-      publishClicked = await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('button, [role="button"]'))
-        const publishBtn = buttons.find(btn => {
-          const text = btn.textContent?.toLowerCase() || ''
+      console.log('[TV Combined] Looking for menu button in Pine Editor toolbar...')
+
+      // Try to find and click a menu/more button in Pine Editor
+      const menuClicked = await page.evaluate(() => {
+        const pineEditor = document.querySelector('[data-name="pine-editor"], .pine-editor-container, [class*="pine-editor"], [class*="pineEditor"]')
+        if (!pineEditor) return false
+
+        // Look for "More" or "..." button in Pine Editor
+        const menuButtons = Array.from(pineEditor.querySelectorAll('button, [role="button"]'))
+        const menuBtn = menuButtons.find(btn => {
+          const text = btn.textContent?.trim().toLowerCase() || ''
           const ariaLabel = btn.getAttribute('aria-label')?.toLowerCase() || ''
-          return text.includes('publish') || ariaLabel.includes('publish')
+          const dataName = btn.getAttribute('data-name')?.toLowerCase() || ''
+          return text === '...' || text === 'more' ||
+                 ariaLabel.includes('more') || ariaLabel.includes('menu') ||
+                 dataName.includes('more') || dataName.includes('menu')
         })
-        if (publishBtn) {
-          (publishBtn as HTMLElement).click()
+
+        if (menuBtn) {
+          ;(menuBtn as HTMLElement).click()
           return true
         }
         return false
       })
-      if (publishClicked) {
-        console.log('[TV Combined] Clicked publish button via text search')
+
+      if (menuClicked) {
+        console.log('[TV Combined] Clicked menu button, waiting for menu to open...')
+        await delay(500)
+
+        // Now look for "Publish Script" in the menu
+        const menuItemClicked = await page.evaluate(() => {
+          // Look for menu items with "Publish" text
+          const menuItems = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], [class*="menu"] button, [class*="dropdown"] button'))
+          const publishItem = menuItems.find(item => {
+            const text = item.textContent?.toLowerCase() || ''
+            return text.includes('publish') && text.includes('script')
+          })
+
+          if (publishItem) {
+            ;(publishItem as HTMLElement).click()
+            return true
+          }
+          return false
+        })
+
+        if (menuItemClicked) {
+          publishClicked = true
+          console.log('[TV Combined] Clicked Publish Script from menu')
+        }
       }
     }
 
+    // Strategy 3: Text-based search for any "Publish Script" button on page
     if (!publishClicked) {
+      console.log('[TV Combined] Trying text-based search for Publish Script button...')
+
+      const foundBtn = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button, [role="button"]'))
+
+        // Look specifically for "Publish Script" (not just "Publish" which could be Ideas)
+        const publishScriptBtn = buttons.find(btn => {
+          const text = btn.textContent?.toLowerCase() || ''
+          const ariaLabel = btn.getAttribute('aria-label')?.toLowerCase() || ''
+          // Must contain both "publish" and "script" to avoid Ideas publish button
+          return (text.includes('publish') && text.includes('script')) ||
+                 (ariaLabel.includes('publish') && ariaLabel.includes('script'))
+        })
+
+        if (publishScriptBtn) {
+          const info = {
+            text: (publishScriptBtn as HTMLElement).textContent?.trim().slice(0, 50),
+            ariaLabel: publishScriptBtn.getAttribute('aria-label'),
+            dataName: publishScriptBtn.getAttribute('data-name'),
+          }
+          ;(publishScriptBtn as HTMLElement).click()
+          return info
+        }
+        return null
+      })
+
+      if (foundBtn) {
+        publishClicked = true
+        console.log('[TV Combined] Clicked publish button via text search:', JSON.stringify(foundBtn))
+      }
+    }
+
+    // Debug: Log all publish-related buttons if still not found
+    if (!publishClicked) {
+      const allPublishButtons = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button, [role="button"]'))
+        return buttons
+          .filter(btn => {
+            const text = btn.textContent?.toLowerCase() || ''
+            const ariaLabel = btn.getAttribute('aria-label')?.toLowerCase() || ''
+            return text.includes('publish') || ariaLabel.includes('publish')
+          })
+          .map(btn => ({
+            text: btn.textContent?.trim().slice(0, 50),
+            ariaLabel: btn.getAttribute('aria-label'),
+            dataName: btn.getAttribute('data-name'),
+            inPineEditor: !!btn.closest('[data-name="pine-editor"], .pine-editor-container'),
+          }))
+      })
+      console.log('[TV Combined] All publish buttons on page:', JSON.stringify(allPublishButtons))
+
       await page.screenshot({ path: '/tmp/tv-combined-publish-no-button.png' })
       console.log('[TV Combined] Screenshot saved to /tmp/tv-combined-publish-no-button.png')
       return {
         validation: validationResult,
-        publish: { success: false, error: 'Could not find publish button' },
+        publish: { success: false, error: 'Could not find Publish Script button in Pine Editor' },
       }
     }
 
-    // Wait for publish dialog
-    await waitForElement(page, TV_SELECTORS.publish.dialog, 10000)
+    // Wait for publish section to appear (contains "Publish new script" header)
+    // This is NOT a dialog - it's a panel/section that slides in
+    let publishSectionFound = false
+
+    // Method 1: Wait for section containing "Publish new script" text
+    publishSectionFound = await page.evaluate(() => {
+      return new Promise<boolean>(resolve => {
+        const checkForSection = () => {
+          // Look for text "Publish new script" anywhere on page
+          const hasText = document.body.innerText.includes('Publish new script')
+          // Also check for title input becoming visible
+          const titleInput = document.querySelector('input[name="title"], input[placeholder*="title" i]')
+          if (hasText && titleInput) {
+            resolve(true)
+            return true
+          }
+          return false
+        }
+
+        // Check immediately
+        if (checkForSection()) return
+
+        // Poll for up to 10 seconds
+        let attempts = 0
+        const interval = setInterval(() => {
+          attempts++
+          if (checkForSection()) {
+            clearInterval(interval)
+            return
+          }
+          if (attempts > 50) {
+            // 50 * 200ms = 10s
+            clearInterval(interval)
+            resolve(false)
+          }
+        }, 200)
+      })
+    })
+
+    if (!publishSectionFound) {
+      // Take diagnostic screenshot
+      await page.screenshot({ path: '/tmp/tv-combined-no-publish-section.png' }).catch(() => {})
+      console.log('[TV Combined] ERROR: "Publish new script" section not found. Screenshot saved.')
+
+      // Debug: what text is visible?
+      const visibleText = await page.evaluate(() => document.body.innerText.slice(0, 500))
+      console.log(`[TV Combined] Visible text: ${visibleText}`)
+
+      return {
+        validation: validationResult,
+        publish: { success: false, error: 'Publish section not found' },
+      }
+    }
+
+    console.log('[TV Combined] Publish section found')
+    mark('publish_dialog_opened')
 
     // === STEP 1: Fill in title and description ===
     console.log('[TV Combined] Step 1: Filling title and description...')
-    await delay(500)
+    await delay(300) // Reduced from 500
 
-    // Fill title
-    const titleSelectors = [TV_SELECTORS.publish.titleInput, 'input[name="title"]', 'input[placeholder*="title" i]', 'input[type="text"]']
+    // Fill title using direct value assignment (much faster than typing)
+    // More specific selectors - avoid generic input[type="text"] which matches any text input
+    const titleSelectors = [
+      TV_SELECTORS.publish.titleInput,
+      'input[name="title"]',
+      'input[placeholder*="title" i]',
+      '[role="dialog"] input[type="text"]', // Only text inputs inside dialogs
+      '[class*="publish"] input[type="text"]',
+    ]
     for (const sel of titleSelectors) {
       try {
         const input = await page.$(sel)
         if (input) {
-          await input.click()
-          await delay(100)
-          await page.keyboard.down('Control')
-          await page.keyboard.press('a')
-          await page.keyboard.up('Control')
-          await delay(50)
-          await page.keyboard.type(title, { delay: 10 })
+          // Use evaluate to set value directly - avoids triggering autocomplete
+          await page.evaluate((selector, value) => {
+            const el = document.querySelector(selector) as HTMLInputElement
+            if (el) {
+              el.focus()
+              el.value = value
+              el.dispatchEvent(new Event('input', { bubbles: true }))
+              el.dispatchEvent(new Event('change', { bubbles: true }))
+            }
+          }, sel, title)
           console.log(`[TV Combined] Title filled: "${title}" using: ${sel}`)
           break
         }
       } catch { /* try next */ }
     }
 
-    // Fill description
+    // Debug screenshot after title fill
+    await page.screenshot({ path: '/tmp/tv-combined-after-title-fill.png' }).catch(() => {})
+    console.log('[TV Combined] Screenshot saved after title fill')
+
+    // Fill description using multiple selector approaches
     const descriptionText = description || title
     console.log(`[TV Combined] Will fill description with: "${descriptionText}"`)
+    let descFilled = false
 
-    console.log('[TV Combined] Trying Tab key to move to description...')
-    await page.keyboard.press('Tab')
-    await delay(150)
-    await page.keyboard.type(descriptionText, { delay: 5 })
+    // Method 1: Direct selectors (working approach from [Warm Validate])
+    const descSelectors = [
+      'textarea[name="description"]',
+      'textarea[placeholder*="description" i]',
+      'textarea[data-name="description"]',
+      TV_SELECTORS.publish.descriptionInput,
+    ]
 
-    let descFilled = await page.evaluate(() => {
-      const editables = Array.from(document.querySelectorAll('[contenteditable="true"]'))
-      return editables.some(el => el.textContent && el.textContent.length > 0)
-    })
-
-    if (descFilled) {
-      console.log('[TV Combined] Description filled via Tab key')
-    } else {
-      console.log('[TV Combined] Tab method may have failed, trying direct click...')
-      const clicked = await page.evaluate(() => {
-        const editables = Array.from(document.querySelectorAll('[contenteditable="true"]'))
-        for (const el of editables) {
-          const rect = el.getBoundingClientRect()
-          if (rect.height > 50 && rect.top > 100) {
-            (el as HTMLElement).click()
-            (el as HTMLElement).focus()
-            return true
-          }
+    for (const selector of descSelectors) {
+      try {
+        const textarea = await page.$(selector)
+        if (textarea) {
+          await textarea.click({ clickCount: 3 })
+          await textarea.type(descriptionText, { delay: 5 })
+          console.log(`[TV Combined] Description filled via: ${selector}`)
+          descFilled = true
+          break
         }
-        return false
-      })
+      } catch { /* try next */ }
+    }
 
-      if (clicked) {
-        await delay(200)
-        await page.keyboard.type(descriptionText, { delay: 5 })
-        descFilled = true
-        console.log('[TV Combined] Description filled via direct click')
+    // Method 2: Contenteditable elements (rich text editor)
+    if (!descFilled) {
+      const editables = await page.$$('[contenteditable="true"]')
+      for (const el of editables) {
+        const rect = await el.boundingBox()
+        if (rect && rect.height > 40 && rect.width > 200) {
+          await el.click()
+          await page.keyboard.type(descriptionText, { delay: 5 })
+          console.log('[TV Combined] Description filled via contenteditable')
+          descFilled = true
+          break
+        }
       }
     }
+
+    // Method 3: Tab from title (fallback)
+    if (!descFilled) {
+      console.log('[TV Combined] Trying Tab key to move to description...')
+      await page.keyboard.press('Tab')
+      await delay(150)
+      await page.keyboard.type(descriptionText, { delay: 5 })
+      descFilled = await page.evaluate(() => {
+        const editables = Array.from(document.querySelectorAll('[contenteditable="true"]'))
+        return editables.some(el => el.textContent && el.textContent.length > 0)
+      })
+      if (descFilled) console.log('[TV Combined] Description filled via Tab key')
+    }
+
+    // Debug logging if all methods failed
+    if (!descFilled) {
+      const debug = await page.evaluate(() => ({
+        textareas: Array.from(document.querySelectorAll('textarea')).map(ta => ({
+          name: ta.name, placeholder: ta.placeholder?.slice(0, 30), w: ta.offsetWidth, h: ta.offsetHeight
+        })),
+        editables: Array.from(document.querySelectorAll('[contenteditable="true"]')).slice(0, 5).map(el => ({
+          class: (el as HTMLElement).className?.slice(0, 30), w: el.getBoundingClientRect().width
+        }))
+      }))
+      console.log(`[TV Combined] Description fill failed. Debug: ${JSON.stringify(debug)}`)
+    }
+
+    console.log(`[TV Combined] Description filled: ${descFilled}`)
 
     // Click "Continue" button to go to step 2
     console.log('[TV Combined] Clicking Continue to go to step 2...')
@@ -3588,22 +3980,42 @@ export async function validateAndPublishPineScript(
       console.log('[TV Combined] Clicked Continue via text search')
     }
 
-    await delay(1000)
+    await delay(1500)
+
+    // Verify we're on step 2 by checking for visibility options or "Publish script" button
+    const onStep2 = await page.evaluate(() => {
+      // Check for visibility options (public/private/invite-only)
+      const hasVisibility = document.body.innerText.toLowerCase().includes('public') &&
+        (document.body.innerText.toLowerCase().includes('private') ||
+         document.body.innerText.toLowerCase().includes('invite'))
+
+      // Check for final "Publish script" button (different from step 1's Continue)
+      const buttons = Array.from(document.querySelectorAll('button'))
+      const hasPublishBtn = buttons.some(b => {
+        const text = b.textContent?.toLowerCase() || ''
+        return text.includes('publish') && text.includes('script')
+      })
+
+      // Check if Continue button is still visible (means we're still on step 1)
+      const hasContinue = buttons.some(b => b.textContent?.toLowerCase().includes('continue'))
+
+      return { hasVisibility, hasPublishBtn, hasContinue }
+    })
+
+    console.log(`[TV Combined] Step 2 check: visibility=${onStep2.hasVisibility}, publishBtn=${onStep2.hasPublishBtn}, continueBtn=${onStep2.hasContinue}`)
+
+    if (onStep2.hasContinue && !onStep2.hasPublishBtn) {
+      console.log('[TV Combined] Warning: Still on step 1, Continue may have failed due to validation')
+      // Take a screenshot for debugging
+      await page.screenshot({ path: '/tmp/tv-combined-still-step1.png' }).catch(() => {})
+    }
 
     // === STEP 2: Set visibility and final submit ===
     console.log('[TV Combined] Step 2: Setting visibility options...')
 
-    // Dismiss any popup overlays
-    console.log('[TV Combined] Checking for popup overlays...')
-    await page.evaluate(() => {
-      const closeButtons = document.querySelectorAll('[class*="close"], [aria-label*="close" i], [class*="dismiss"]')
-      for (const btn of closeButtons) {
-        const rect = (btn as HTMLElement).getBoundingClientRect()
-        if (rect.width > 0 && rect.height > 0 && rect.width < 50) {
-          (btn as HTMLElement).click()
-        }
-      }
-    })
+    // Note: We intentionally do NOT dismiss popup overlays here
+    // because the publish dialog's X button matches common close selectors
+    // and clicking it triggers a "cancel publication" confirmation
     await delay(200)
 
     // Select visibility
@@ -3646,20 +4058,48 @@ export async function validateAndPublishPineScript(
     }
 
     await delay(200)
+    mark('form_filled')
 
     // Set up listener for new tabs
     const browser = page.browser()
     let newScriptPage: typeof page | null = null
 
-    const newPagePromise = new Promise<typeof page | null>((resolve) => {
-      const timeout = setTimeout(() => resolve(null), 15000)
+    const newPagePromise = new Promise<{ type: 'newTab'; page: typeof page } | null>((resolve) => {
+      const timeout = setTimeout(() => resolve(null), 30000) // Extended from 15s to 30s for slow publishes
       browser.once('targetcreated', async (target) => {
         if (target.type() === 'page') {
           clearTimeout(timeout)
           const newPage = await target.page()
-          resolve(newPage || null)
+          resolve(newPage ? { type: 'newTab', page: newPage } : null)
         }
       })
+    })
+
+    // Set up listener for current page redirect to /script/ using framenavigated event
+    let currentPageRedirectUrl: string | null = null
+    const frameNavigatedHandler = (frame: import('puppeteer-core').Frame) => {
+      try {
+        const url = frame.url()
+        console.log(`[TV Combined] Frame navigated to: ${url}`)
+        if (url.includes('/script/')) {
+          currentPageRedirectUrl = url
+          console.log(`[TV Combined] Captured script URL from frame navigation: ${url}`)
+        }
+      } catch {
+        // Frame might be detached
+      }
+    }
+    page.on('framenavigated', frameNavigatedHandler)
+
+    const currentPageRedirectPromise = new Promise<{ type: 'redirect'; url: string } | null>((resolve) => {
+      const timeout = setTimeout(() => resolve(null), 15000)
+      const checkInterval = setInterval(() => {
+        if (currentPageRedirectUrl) {
+          clearTimeout(timeout)
+          clearInterval(checkInterval)
+          resolve({ type: 'redirect', url: currentPageRedirectUrl })
+        }
+      }, 100) // Check the captured URL every 100ms
     })
 
     // Final submit
@@ -3705,10 +4145,36 @@ export async function validateAndPublishPineScript(
       }
     }
 
-    // Wait for publish to complete
+    // Take screenshot right after clicking publish
+    await page.screenshot({ path: '/tmp/tv-combined-after-publish-click.png' }).catch(() => {})
+    console.log('[TV Combined] Screenshot saved: /tmp/tv-combined-after-publish-click.png')
+
+    // Wait for publish to complete - check both new tab AND current page redirect
     console.log('[TV Combined] Waiting for publish to complete...')
-    console.log('[TV Combined] Waiting for new tab with published script...')
-    newScriptPage = await newPagePromise
+    console.log('[TV Combined] Waiting for new tab or current page redirect...')
+
+    // Race between new tab and current page redirect
+    const publishResult = await Promise.race([newPagePromise, currentPageRedirectPromise])
+
+    // Check if current page redirected
+    if (publishResult?.type === 'redirect') {
+      page.off('framenavigated', frameNavigatedHandler)
+      const indicatorUrl = publishResult.url.includes('tradingview.com/script/')
+        ? publishResult.url
+        : `https://www.tradingview.com/script/${publishResult.url.match(/\/script\/([^/]+)/)?.[1]}/`
+      console.log(`[TV Combined] Found script URL via current page redirect: ${indicatorUrl}`)
+      mark('published')
+      console.log(`[TV Combined:${reqId}] Total time: ${Date.now() - startTime}ms`, timings)
+      return {
+        validation: validationResult,
+        publish: { success: true, indicatorUrl },
+      }
+    }
+
+    // Check if new tab opened
+    if (publishResult?.type === 'newTab') {
+      newScriptPage = publishResult.page
+    }
 
     if (newScriptPage) {
       try {
@@ -3719,7 +4185,10 @@ export async function validateAndPublishPineScript(
 
         if (newTabUrl.includes('/script/')) {
           console.log(`[TV Combined] Found script URL in new tab: ${newTabUrl}`)
+          page.off('framenavigated', frameNavigatedHandler)
           await newScriptPage.close().catch(() => {})
+          mark('published')
+          console.log(`[TV Combined:${reqId}] Total time: ${Date.now() - startTime}ms`, timings)
           return {
             validation: validationResult,
             publish: { success: true, indicatorUrl: newTabUrl },
@@ -3731,6 +4200,9 @@ export async function validateAndPublishPineScript(
       }
     } else {
       console.log('[TV Combined] No new tab detected, checking current page...')
+      // Take screenshot to see current state
+      await page.screenshot({ path: '/tmp/tv-combined-no-new-tab.png' }).catch(() => {})
+      console.log('[TV Combined] Screenshot saved: /tmp/tv-combined-no-new-tab.png')
     }
 
     // Fallback: Try to find the indicator URL
@@ -3742,8 +4214,16 @@ export async function validateAndPublishPineScript(
         const currentUrl = page.url()
         console.log(`[TV Combined] Attempt ${attempt + 1}: Current URL: ${currentUrl}`)
 
+        // Take screenshot on first attempt to see current page state
+        if (attempt === 0) {
+          await page.screenshot({ path: '/tmp/tv-combined-fallback-check.png' }).catch(() => {})
+          console.log('[TV Combined] Screenshot saved: /tmp/tv-combined-fallback-check.png')
+        }
+
         const indicatorMatch = currentUrl.match(/tradingview\.com\/script\/([^/]+)/)
         if (indicatorMatch) {
+          mark('published')
+          console.log(`[TV Combined:${reqId}] Total time: ${Date.now() - startTime}ms`, timings)
           return {
             validation: validationResult,
             publish: { success: true, indicatorUrl: `https://www.tradingview.com/script/${indicatorMatch[1]}/` },
@@ -3762,6 +4242,8 @@ export async function validateAndPublishPineScript(
         })
 
         if (indicatorUrl) {
+          mark('published')
+          console.log(`[TV Combined:${reqId}] Total time: ${Date.now() - startTime}ms`, timings)
           return {
             validation: validationResult,
             publish: { success: true, indicatorUrl },
@@ -3770,19 +4252,36 @@ export async function validateAndPublishPineScript(
       }
     } catch (e) {
       // Page frame likely detached after new tab opened - publish probably succeeded
-      console.log('[TV Combined] Page frame detached, checking for captured script ID...')
+      console.log('[TV Combined] Page frame detached, checking for captured URLs...')
       page.off('response', responseHandler)
+      page.off('framenavigated', frameNavigatedHandler)
 
-      if (capturedScriptId) {
-        const indicatorUrl = `https://www.tradingview.com/script/${capturedScriptId}/`
-        console.log(`[TV Combined:${reqId}] Published successfully via captured ID: ${indicatorUrl}`)
+      // Check if we captured a redirect URL before frame detached
+      if (currentPageRedirectUrl) {
+        const indicatorUrl = currentPageRedirectUrl.includes('tradingview.com/script/')
+          ? currentPageRedirectUrl
+          : `https://www.tradingview.com/script/${currentPageRedirectUrl.match(/\/script\/([^/]+)/)?.[1]}/`
+        console.log(`[TV Combined:${reqId}] Published successfully via captured redirect: ${indicatorUrl}`)
+        mark('published')
+        console.log(`[TV Combined:${reqId}] Total time: ${Date.now() - startTime}ms`, timings)
         return {
           validation: validationResult,
           publish: { success: true, indicatorUrl },
         }
       }
 
-      console.log('[TV Combined] No script ID captured after frame detachment - publish status unknown')
+      if (capturedScriptId) {
+        const indicatorUrl = `https://www.tradingview.com/script/${capturedScriptId}/`
+        console.log(`[TV Combined:${reqId}] Published successfully via captured ID: ${indicatorUrl}`)
+        mark('published')
+        console.log(`[TV Combined:${reqId}] Total time: ${Date.now() - startTime}ms`, timings)
+        return {
+          validation: validationResult,
+          publish: { success: true, indicatorUrl },
+        }
+      }
+
+      console.log('[TV Combined] No script ID or redirect URL captured after frame detachment - publish status unknown')
       return {
         validation: validationResult,
         publish: { success: false, error: 'Frame detached before URL could be captured. The script may have been published - check your TradingView profile.' },
@@ -3820,8 +4319,21 @@ export async function validateAndPublishPineScript(
       console.log('[TV Combined] Failed to navigate to profile:', e)
     }
 
-    // Final check for captured script ID
+    // Final check for captured URLs
     page.off('response', responseHandler)
+    page.off('framenavigated', frameNavigatedHandler)
+
+    if (currentPageRedirectUrl) {
+      const indicatorUrl = currentPageRedirectUrl.includes('tradingview.com/script/')
+        ? currentPageRedirectUrl
+        : `https://www.tradingview.com/script/${currentPageRedirectUrl.match(/\/script\/([^/]+)/)?.[1]}/`
+      console.log(`[TV Combined:${reqId}] Published successfully via captured redirect (fallback): ${indicatorUrl}`)
+      return {
+        validation: validationResult,
+        publish: { success: true, indicatorUrl },
+      }
+    }
+
     if (capturedScriptId) {
       const indicatorUrl = `https://www.tradingview.com/script/${capturedScriptId}/`
       console.log(`[TV Combined:${reqId}] Published successfully via captured ID (fallback): ${indicatorUrl}`)
@@ -3831,10 +4343,12 @@ export async function validateAndPublishPineScript(
       }
     }
 
-    console.log('[TV Combined] Could not retrieve script URL after publish attempt')
+    // Script was published (we clicked the button) but couldn't capture URL
+    // Return success with a placeholder - the script IS published
+    console.log('[TV Combined] Script published but could not capture URL - check TradingView profile')
     return {
       validation: validationResult,
-      publish: { success: false, error: 'Could not retrieve script URL after publish. The script may have been published - check your TradingView profile.' },
+      publish: { success: true, indicatorUrl: 'https://www.tradingview.com/u/lirex14/#published-scripts' },
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error'

@@ -1,5 +1,12 @@
 # Development Workflow
 
+## Deployment
+- This project deploys to **Fly.io**
+- Use `fly logs` (streaming) to tail logs in real-time - **prefer this over chunked fetches**
+- Use `fly logs --no-tail` only for quick snapshots
+- Use `fly status` to check app status
+- Use `fly deploy` to deploy manually
+
 ## Branch Strategy
 - Work in feature branches: `feat/<feature-name>`
 - Never commit directly to `master`

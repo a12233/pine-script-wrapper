@@ -78,7 +78,8 @@ function ValidatePage() {
   })
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
-  const [visibility, setVisibility] = useState<'public' | 'private'>('public')
+  // Visibility is always public when using service account
+  const visibility = 'public' as const
   const [isCreatingCheckout, setIsCreatingCheckout] = useState(false)
   const [productDetails, setProductDetails] = useState<ProductDetails | null>(null)
 
@@ -257,34 +258,6 @@ function ValidatePage() {
               placeholder="Describe what your indicator does..."
               rows={3}
             />
-          </div>
-
-          <div className="form-group">
-            <label>Visibility</label>
-            <div className="visibility-options">
-              <label className="radio-label">
-                <input
-                  type="radio"
-                  name="visibility"
-                  value="public"
-                  checked={visibility === 'public'}
-                  onChange={() => setVisibility('public')}
-                />
-                <span>Public</span>
-                <small>Anyone can view and use your indicator</small>
-              </label>
-              <label className="radio-label">
-                <input
-                  type="radio"
-                  name="visibility"
-                  value="private"
-                  checked={visibility === 'private'}
-                  onChange={() => setVisibility('private')}
-                />
-                <span>Private</span>
-                <small>Only you can see and use this indicator</small>
-              </label>
-            </div>
           </div>
 
           <div className="price-info">
