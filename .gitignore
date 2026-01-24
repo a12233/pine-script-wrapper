@@ -24,3 +24,6 @@ todos.json
 progress.json
 status.json
 logs/
+
+# Workflow reference screenshots (not for version control)
+docs/workflow-screenshots/

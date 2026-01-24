@@ -30,11 +30,23 @@ Reference these notes for:
 
 ## TradingView Automation Notes
 
-### Critical: /pine/ vs /chart/ Page Differences
+### CRITICAL: /pine/ vs /chart/ - Publishing REQUIRES /chart/
 
-**The "Publish script" option ONLY exists on the /chart/ page, NOT on /pine/.**
+**PUBLISHING CAN ONLY BE DONE ON /chart/ PAGE. NEVER ON /pine/.**
 
-The script name dropdown on `/pine/` page contains:
+| Feature | /pine/ Page | /chart/ Page |
+|---------|-------------|--------------|
+| Validate script | ✅ Yes | ✅ Yes |
+| Add to chart | ✅ Yes | ✅ Yes |
+| **Publish script** | ❌ NO | ✅ **YES** |
+| Has canvas element | ✅ Yes (mini preview) | ✅ Yes (full chart) |
+| Has Monaco editor | ✅ Yes (fullscreen) | ✅ Yes (in panel) |
+
+**Common Pitfall**: The `/pine/` page has a canvas element (mini chart preview), which can trick code into thinking it's on the chart page. ALWAYS check the URL contains `/chart/` before attempting to publish.
+
+### Script Name Dropdown on /pine/ (NO Publish option!)
+
+The dropdown on `/pine/` page contains:
 - Save script (Ctrl + S)
 - Make a copy…
 - Rename…
@@ -43,18 +55,20 @@ The script name dropdown on `/pine/` page contains:
 - Create new
 - Open script… (Ctrl + O)
 
-**NO Publish option exists in this menu.**
+**NO Publish option exists in this menu on /pine/.**
 
-The "Publish script" button is only available in the **Pine Editor toolbar on the /chart/ page**. To publish a script:
+### How to Publish
+
+The "Publish script" button is ONLY available in the **Pine Editor toolbar on the /chart/ page**:
 1. Navigate to `/chart/` (not `/pine/`)
-2. Open the Pine Editor panel (click Pine button in bottom toolbar)
+2. Open the Pine Editor panel
 3. The "Publish script" button appears in the Pine Editor's own toolbar
 
-### Workflow Implications
-- **Validation**: Can be done on `/pine/` page (has "Add to chart" button)
-- **Publishing**: MUST be done on `/chart/` page (has "Publish script" button in Pine Editor toolbar)
+### Workflow Summary
+- **Validation**: `/pine/` page (fast, has "Add to chart")
+- **Publishing**: MUST navigate to `/chart/` page (has "Publish script" button)
 
-This is why the combined validation+publish flow navigates between pages.
+The combined validation+publish flow MUST navigate from /pine/ to /chart/ after validation.
 
 ### Known Issue: Opening Pine Editor on /chart/
 

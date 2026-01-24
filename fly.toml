@@ -4,7 +4,7 @@
 #
 
 app = 'pine-script-wrapper'
-primary_region = 'sjc'
+primary_region = 'iad'
 
 [build]
 
@@ -13,6 +13,12 @@ primary_region = 'sjc'
   PORT = '3000'
   # Phase B: Use /pine/ endpoint for faster validation/publishing
   TV_USE_PINE_PAGE = 'true'
+  # Persistent screenshot storage on Fly volume
+  SCREENSHOT_DIR = '/data/screenshots'
+
+[[mounts]]
+  source = "screenshots"
+  destination = "/data/screenshots"
 
 [http_service]
   internal_port = 3000

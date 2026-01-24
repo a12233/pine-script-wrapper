@@ -10,7 +10,7 @@
 import puppeteer, { Browser, Page } from 'puppeteer-core'
 import fs from 'fs'
 import { injectCookies } from './browserless'
-import { parseTVCookies, TV_SELECTORS, type TVCredentials } from './tradingview'
+import { parseTVCookies, TV_SELECTORS, SCREENSHOT_DIR, type TVCredentials } from './tradingview'
 
 // Environment configuration
 const USE_WARM_LOCAL_BROWSER = process.env.USE_WARM_LOCAL_BROWSER === 'true'
@@ -175,8 +175,8 @@ async function createWarmSession(credentials: TVCredentials): Promise<WarmSessio
     console.log('[Warm Session] WARNING: May not be logged in to TradingView')
     // Take screenshot for debugging
     try {
-      await page.screenshot({ path: '/tmp/warm-session-not-logged-in.png' })
-      console.log('[Warm Session] Screenshot saved to /tmp/warm-session-not-logged-in.png')
+      await page.screenshot({ path: `${SCREENSHOT_DIR}/warm-session-not-logged-in.png` })
+      console.log(`[Warm Session] Screenshot saved to ${SCREENSHOT_DIR}/warm-session-not-logged-in.png`)
     } catch (e) {
       console.log('[Warm Session] Could not take screenshot')
     }
@@ -265,8 +265,8 @@ async function createWarmSession(credentials: TVCredentials): Promise<WarmSessio
   if (!editorFound) {
     // Take screenshot for debugging
     try {
-      await page.screenshot({ path: '/tmp/warm-session-editor-not-found.png' })
-      console.log('[Warm Session] Screenshot saved to /tmp/warm-session-editor-not-found.png')
+      await page.screenshot({ path: `${SCREENSHOT_DIR}/warm-session-editor-not-found.png` })
+      console.log(`[Warm Session] Screenshot saved to ${SCREENSHOT_DIR}/warm-session-editor-not-found.png`)
     } catch (e) {
       console.log('[Warm Session] Could not take screenshot:', e)
     }
