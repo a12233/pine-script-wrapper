@@ -2046,6 +2046,7 @@ export async function validateAndPublishWithWarmSession(
           return `title-js:${titleMatch.getAttribute('title')}`
         }
         // Text-based search: find "Publish" in buttons/clickable elements
+        const allClickable = Array.from(document.querySelectorAll('button, [role="button"], div, span, a'))
         const publishEl = allClickable.find(el => {
           const text = el.textContent?.trim().toLowerCase() || ''
           return text.includes('publish') &&
