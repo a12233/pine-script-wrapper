@@ -2034,9 +2034,19 @@ export async function validateAndPublishWithWarmSession(
             return `attr:${sel}`
           }
         }
+        // Title attribute search (works better than CSS case-insensitive in headless Chrome)
+        const allClickable = Array.from(document.querySelectorAll('button, [role="button"], div, span, a'))
+        const titleMatch = allClickable.find(el => {
+          const title = el.getAttribute('title')?.toLowerCase() || ''
+          return (title.includes('publish') || title.includes('share your script')) &&
+                 el.getBoundingClientRect().width > 0
+        })
+        if (titleMatch) {
+          (titleMatch as HTMLElement).click()
+          return `title-js:${titleMatch.getAttribute('title')}`
+        }
         // Text-based search: find "Publish" in buttons/clickable elements
-        const allElements = Array.from(document.querySelectorAll('button, [role="button"], div, span, a'))
-        const publishEl = allElements.find(el => {
+        const publishEl = allClickable.find(el => {
           const text = el.textContent?.trim().toLowerCase() || ''
           return text.includes('publish') &&
                  el.getBoundingClientRect().width > 0 &&
