@@ -2026,8 +2026,8 @@ export async function validateAndPublishWithWarmSession(
             return `selector:${sel}`
           }
         }
-        // Try aria-label / title selectors
-        for (const sel of ['[aria-label*="Publish" i]', '[title*="Publish" i]', 'button[class*="publish" i]']) {
+        // Try aria-label / title selectors (including "Share your script" which is the current TradingView button title)
+        for (const sel of ['[aria-label*="Publish" i]', '[title*="Publish" i]', '[title*="Share your script" i]', 'button[class*="publish" i]']) {
           const btn = document.querySelector(sel) as HTMLElement
           if (btn && btn.getBoundingClientRect().width > 0) {
             btn.click()
