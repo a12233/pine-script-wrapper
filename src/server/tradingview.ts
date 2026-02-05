@@ -2034,9 +2034,9 @@ export async function validateAndPublishWithWarmSession(
             return `attr:${sel}`
           }
         }
-        // Title attribute search (works better than CSS case-insensitive in headless Chrome)
-        const allClickable = Array.from(document.querySelectorAll('button, [role="button"], div, span, a'))
-        const titleMatch = allClickable.find(el => {
+        // Title attribute search - search ALL elements with title attribute
+        const allWithTitle = Array.from(document.querySelectorAll('[title]'))
+        const titleMatch = allWithTitle.find(el => {
           const title = el.getAttribute('title')?.toLowerCase() || ''
           return (title.includes('publish') || title.includes('share your script')) &&
                  el.getBoundingClientRect().width > 0
