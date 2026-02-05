@@ -2189,154 +2189,159 @@ export async function validateAndPublishWithWarmSession(
       await delay(500)
     }
 
-    // === STEP 1: Fill title and description ===
+    // === STEP 1: Fill title and description (broken into small steps with timeouts) ===
     console.log('[Warm Validate] Step 1: Filling title and description...')
     const { visibilityLevel } = publishOptions
-
-    // Wait for publish dialog content to load (title input or contenteditable)
-    console.log('[Warm Validate] Waiting for publish dialog form to load...')
-    let dialogFormReady = false
-    for (let attempt = 0; attempt < 10; attempt++) {
-      dialogFormReady = await page.evaluate(() => {
-        // Check for title input
-        const inputs = Array.from(document.querySelectorAll('input'))
-          .filter(el => el.getBoundingClientRect().width > 100)
-        if (inputs.length > 0) return true
-        // Check for contenteditable description
-        const editables = Array.from(document.querySelectorAll('[contenteditable="true"]'))
-          .filter(el => el.getBoundingClientRect().width > 100)
-        if (editables.length > 0) return true
-        return false
-      })
-      if (dialogFormReady) {
-        console.log(`[Warm Validate] Dialog form loaded after ${attempt + 1} attempts`)
-        break
-      }
-      await delay(1000)
-    }
-    if (!dialogFormReady) {
-      console.log('[Warm Validate] Dialog form did not load - saving debug screenshot')
-      await page.screenshot({ path: `${SCREENSHOT_DIR}/warm-publish-dialog-not-loaded.png` }).catch(() => {})
-    }
-
-    // Do ALL dialog interactions in a single page.evaluate to minimize slow CDP round-trips
     const descriptionText = description || title
-    console.log('[Warm Validate] Filling dialog (single evaluate: title, desc, continue, visibility)...')
-    const fillResult = await Promise.race([
-      page.evaluate(async (opts: { title: string; description: string; privacy: string }) => {
-        const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
-        const result: string[] = []
+    const fillResult: string[] = []
 
-        // Step 1: Fill title
-        const titleSelectors = [
+    // Helper for running page.evaluate with timeout
+    const evalWithTimeout = async <T>(fn: () => Promise<T>, timeoutMs: number, fallback: T): Promise<T> => {
+      try {
+        return await Promise.race([
+          fn(),
+          new Promise<T>((_, reject) => setTimeout(() => reject(new Error('TIMEOUT')), timeoutMs)),
+        ])
+      } catch (e) {
+        return fallback
+      }
+    }
+
+    // Step 1a: Wait for dialog form to load (with shorter timeout)
+    console.log('[Warm Validate] Waiting for publish dialog form...')
+    const dialogReady = await evalWithTimeout(async () => {
+      for (let attempt = 0; attempt < 15; attempt++) {
+        const ready = await page.evaluate(() => {
+          const inputs = Array.from(document.querySelectorAll('input'))
+            .filter(el => el.getBoundingClientRect().width > 100)
+          return inputs.length > 0
+        })
+        if (ready) {
+          console.log(`[Warm Validate] Dialog form ready after ${attempt + 1} attempts`)
+          return true
+        }
+        await delay(500)
+      }
+      return false
+    }, 10000, false)
+
+    if (!dialogReady) {
+      console.log('[Warm Validate] Dialog form not ready - taking screenshot')
+      await page.screenshot({ path: `${SCREENSHOT_DIR}/dialog-not-ready.png` }).catch(() => {})
+      fillResult.push('dialog:NOT_READY')
+    } else {
+      fillResult.push('dialog:READY')
+    }
+
+    // Step 1b: Fill title (5 second timeout)
+    console.log('[Warm Validate] Filling title...')
+    const titleFilled = await evalWithTimeout(async () => {
+      return await page.evaluate((titleText: string) => {
+        const selectors = [
           'input[placeholder="Title"]',
           'input[value="My script"]',
           'input[placeholder="My script"]',
-          'input[class*="title-input"]',
+          'input[class*="title"]',
         ]
-        let titleFilled = false
-        for (const sel of titleSelectors) {
+        for (const sel of selectors) {
           const input = document.querySelector(sel) as HTMLInputElement
           if (input && input.getBoundingClientRect().width > 100) {
             const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
-            if (setter) setter.call(input, opts.title)
-            else input.value = opts.title
+            if (setter) setter.call(input, titleText)
+            else input.value = titleText
             input.dispatchEvent(new Event('input', { bubbles: true }))
             input.dispatchEvent(new Event('change', { bubbles: true }))
-            result.push(`title:${sel}`)
-            titleFilled = true
-            break
+            return sel
           }
         }
-        if (!titleFilled) result.push('title:FAILED')
+        // Fallback: try any visible input
+        const inputs = Array.from(document.querySelectorAll('input'))
+          .filter(el => el.getBoundingClientRect().width > 100) as HTMLInputElement[]
+        if (inputs.length > 0) {
+          const input = inputs[0]
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+          if (setter) setter.call(input, titleText)
+          else input.value = titleText
+          input.dispatchEvent(new Event('input', { bubbles: true }))
+          input.dispatchEvent(new Event('change', { bubbles: true }))
+          return 'input[0]'
+        }
+        return null
+      }, title)
+    }, 5000, null)
+    fillResult.push(titleFilled ? `title:${titleFilled}` : 'title:FAILED')
 
-        // Step 1: Fill description - try multiple approaches
-        let descFilled = false
-
-        // Approach 1: contenteditable elements (original)
+    // Step 1c: Fill description (5 second timeout)
+    console.log('[Warm Validate] Filling description...')
+    const descFilled = await evalWithTimeout(async () => {
+      return await page.evaluate((descText: string) => {
+        // Try contenteditable first
         const editables = Array.from(document.querySelectorAll('[contenteditable="true"]'))
-        const editableDebug = editables.map(el => {
-          const rect = el.getBoundingClientRect()
-          return { tag: el.tagName, w: Math.round(rect.width), h: Math.round(rect.height), class: el.className?.toString?.().slice(0, 60) }
-        })
-        result.push(`editables:${JSON.stringify(editableDebug)}`)
-        for (const el of editables) {
-          const rect = el.getBoundingClientRect()
-          // Lower thresholds - any visible contenteditable that's not the tiny Monaco textarea
-          if (rect.height > 20 && rect.width > 100) {
-            const htmlEl = el as HTMLElement
-            htmlEl.focus()
-            htmlEl.innerText = opts.description
-            htmlEl.dispatchEvent(new Event('input', { bubbles: true }))
-            result.push('desc:contenteditable')
-            descFilled = true
-            break
-          }
+          .filter(el => el.getBoundingClientRect().height > 20 && el.getBoundingClientRect().width > 100) as HTMLElement[]
+        if (editables.length > 0) {
+          const el = editables[0]
+          el.focus()
+          el.innerText = descText
+          el.dispatchEvent(new Event('input', { bubbles: true }))
+          return 'contenteditable'
         }
-
-        // Approach 2: textarea elements
-        if (!descFilled) {
-          const textareas = Array.from(document.querySelectorAll('textarea'))
-            .filter(el => el.getBoundingClientRect().width > 100 && el.getBoundingClientRect().height > 20)
-          if (textareas.length > 0) {
-            const ta = textareas[0]
-            const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
-            if (setter) setter.call(ta, opts.description)
-            else ta.value = opts.description
-            ta.dispatchEvent(new Event('input', { bubbles: true }))
-            ta.dispatchEvent(new Event('change', { bubbles: true }))
-            result.push(`desc:textarea`)
-            descFilled = true
-          }
+        // Try textarea
+        const textareas = Array.from(document.querySelectorAll('textarea'))
+          .filter(el => el.getBoundingClientRect().width > 100) as HTMLTextAreaElement[]
+        if (textareas.length > 0) {
+          const ta = textareas[0]
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
+          if (setter) setter.call(ta, descText)
+          else ta.value = descText
+          ta.dispatchEvent(new Event('input', { bubbles: true }))
+          return 'textarea'
         }
+        return null
+      }, descriptionText)
+    }, 5000, null)
+    fillResult.push(descFilled ? `desc:${descFilled}` : 'desc:FAILED')
 
-        // Approach 3: second input field (description as input)
-        if (!descFilled) {
-          const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'))
-            .filter(el => el.getBoundingClientRect().width > 100)
-          // Skip the first one (title), use the second if available
-          if (inputs.length > 1) {
-            const input = inputs[1] as HTMLInputElement
-            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
-            if (setter) setter.call(input, opts.description)
-            else input.value = opts.description
-            input.dispatchEvent(new Event('input', { bubbles: true }))
-            input.dispatchEvent(new Event('change', { bubbles: true }))
-            result.push(`desc:input[1]`)
-            descFilled = true
-          }
-        }
+    await delay(300)
 
-        if (!descFilled) result.push('desc:FAILED')
-
-        await sleep(500)
-
-        // Click Continue
+    // Step 1d: Click Continue button (5 second timeout)
+    console.log('[Warm Validate] Looking for Continue button...')
+    const continueClicked = await evalWithTimeout(async () => {
+      return await page.evaluate(() => {
         const buttons = Array.from(document.querySelectorAll('button'))
-        const continueBtn = buttons.find(b => b.textContent?.toLowerCase().includes('continue'))
+        const continueBtn = buttons.find(b => {
+          const text = b.textContent?.toLowerCase() || ''
+          return text.includes('continue') || text.includes('next')
+        })
         if (continueBtn) {
           continueBtn.click()
-          result.push('continue:OK')
-          await sleep(1500)
-        } else {
-          result.push('continue:FAILED')
+          return true
         }
+        return false
+      })
+    }, 5000, false)
+    fillResult.push(continueClicked ? 'continue:OK' : 'continue:FAILED')
 
-        // Step 2: Click Public/Private
-        const allBtns = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"], label'))
-        const privacyBtn = allBtns.find(b => b.textContent?.toLowerCase().trim() === opts.privacy)
+    // Wait for page transition after Continue
+    if (continueClicked) {
+      await delay(1500)
+    }
+
+    // Step 1e: Click Public/Private (5 second timeout)
+    console.log(`[Warm Validate] Setting visibility to: ${visibility}...`)
+    const privacySet = await evalWithTimeout(async () => {
+      return await page.evaluate((privacy: string) => {
+        const elements = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"], label, [role="radio"]'))
+        const privacyBtn = elements.find(b => b.textContent?.toLowerCase().trim() === privacy)
         if (privacyBtn) {
           (privacyBtn as HTMLElement).click()
-          result.push(`privacy:${opts.privacy}`)
-          await sleep(300)
-        } else {
-          result.push('privacy:FAILED')
+          return true
         }
+        return false
+      }, visibility)
+    }, 5000, false)
+    fillResult.push(privacySet ? `privacy:${visibility}` : 'privacy:FAILED')
 
-        return result
-      }, { title, description: descriptionText, privacy: visibility }),
-      new Promise<string[]>((r) => setTimeout(() => r(['TIMEOUT']), 60000)),
-    ])
+    await delay(300)
     console.log(`[Warm Validate] Dialog fill result: ${JSON.stringify(fillResult)}`)
 
     await delay(300)
