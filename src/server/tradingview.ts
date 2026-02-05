@@ -2016,51 +2016,78 @@ export async function validateAndPublishWithWarmSession(
 
     // Click publish button - use page.evaluate since page.$ is equally slow on this page
     console.log('[Warm Validate] Looking for publish button...')
-    let publishClicked = await Promise.race([
-      page.evaluate(() => {
-        // Try data-name selectors (including publish-button from Pine Editor toolbar)
-        for (const sel of ['[data-name="publish-script-button"]', '[data-name="save-publish-button"]', '[data-name="publish-button"]']) {
-          const btn = document.querySelector(sel) as HTMLElement
-          if (btn && btn.getBoundingClientRect().width > 0) {
-            btn.click()
-            return `selector:${sel}`
+
+    // First, try a simple direct query for the share button
+    const directClick = await page.evaluate(() => {
+      // Find all elements with title containing "Share"
+      const shareBtn = document.querySelector('[title*="Share your script" i]') as HTMLElement
+      if (shareBtn) {
+        const rect = shareBtn.getBoundingClientRect()
+        if (rect.width > 0) {
+          shareBtn.click()
+          return `direct:${shareBtn.getAttribute('title')}|w=${rect.width}`
+        }
+        return `found-but-no-width:${shareBtn.getAttribute('title')}|w=${rect.width}`
+      }
+      // Count elements with title attribute
+      const allTitles = document.querySelectorAll('[title]')
+      const shareMatches = Array.from(allTitles).filter(el =>
+        el.getAttribute('title')?.toLowerCase().includes('share')
+      )
+      return `not-found:total-titles=${allTitles.length},share-matches=${shareMatches.length}`
+    }).catch((e: Error) => `error:${e.message}`)
+
+    console.log(`[Warm Validate] Direct share button search: ${directClick}`)
+
+    let publishClicked = directClick?.startsWith('direct:') ? directClick : null
+
+    if (!publishClicked) {
+      publishClicked = await Promise.race([
+        page.evaluate(() => {
+          // Try data-name selectors (including publish-button from Pine Editor toolbar)
+          for (const sel of ['[data-name="publish-script-button"]', '[data-name="save-publish-button"]', '[data-name="publish-button"]']) {
+            const btn = document.querySelector(sel) as HTMLElement
+            if (btn && btn.getBoundingClientRect().width > 0) {
+              btn.click()
+              return `selector:${sel}`
+            }
           }
-        }
-        // Try aria-label / title selectors (including "Share your script" which is the current TradingView button title)
-        for (const sel of ['[aria-label*="Publish" i]', '[title*="Publish" i]', '[title*="Share your script" i]', 'button[class*="publish" i]']) {
-          const btn = document.querySelector(sel) as HTMLElement
-          if (btn && btn.getBoundingClientRect().width > 0) {
-            btn.click()
-            return `attr:${sel}`
+          // Try aria-label / title selectors (including "Share your script" which is the current TradingView button title)
+          for (const sel of ['[aria-label*="Publish" i]', '[title*="Publish" i]', '[title*="Share your script" i]', 'button[class*="publish" i]']) {
+            const btn = document.querySelector(sel) as HTMLElement
+            if (btn && btn.getBoundingClientRect().width > 0) {
+              btn.click()
+              return `attr:${sel}`
+            }
           }
-        }
-        // Title attribute search - search ALL elements with title attribute
-        const allWithTitle = Array.from(document.querySelectorAll('[title]'))
-        const titleMatch = allWithTitle.find(el => {
-          const title = el.getAttribute('title')?.toLowerCase() || ''
-          return (title.includes('publish') || title.includes('share your script')) &&
-                 el.getBoundingClientRect().width > 0
-        })
-        if (titleMatch) {
-          (titleMatch as HTMLElement).click()
-          return `title-js:${titleMatch.getAttribute('title')}`
-        }
-        // Text-based search: find "Publish" in buttons/clickable elements
-        const allClickable = Array.from(document.querySelectorAll('button, [role="button"], div, span, a'))
-        const publishEl = allClickable.find(el => {
-          const text = el.textContent?.trim().toLowerCase() || ''
-          return text.includes('publish') &&
-                 el.getBoundingClientRect().width > 0 &&
-                 el.children.length <= 3
-        })
-        if (publishEl) {
-          (publishEl as HTMLElement).click()
-          return `text:${publishEl.textContent?.trim()}`
-        }
-        return null
-      }),
-      new Promise<null>((r) => setTimeout(() => r(null), 30000)),
-    ])
+          // Title attribute search - search ALL elements with title attribute
+          const allWithTitle = Array.from(document.querySelectorAll('[title]'))
+          const titleMatch = allWithTitle.find(el => {
+            const title = el.getAttribute('title')?.toLowerCase() || ''
+            return (title.includes('publish') || title.includes('share your script')) &&
+                   el.getBoundingClientRect().width > 0
+          })
+          if (titleMatch) {
+            (titleMatch as HTMLElement).click()
+            return `title-js:${titleMatch.getAttribute('title')}`
+          }
+          // Text-based search: find "Publish" in buttons/clickable elements
+          const allClickable = Array.from(document.querySelectorAll('button, [role="button"], div, span, a'))
+          const publishEl = allClickable.find(el => {
+            const text = el.textContent?.trim().toLowerCase() || ''
+            return text.includes('publish') &&
+                   el.getBoundingClientRect().width > 0 &&
+                   el.children.length <= 3
+          })
+          if (publishEl) {
+            (publishEl as HTMLElement).click()
+            return `text:${publishEl.textContent?.trim()}`
+          }
+          return null
+        }),
+        new Promise<null>((r) => setTimeout(() => r(null), 30000)),
+      ])
+    }
     if (publishClicked) {
       console.log(`[Warm Validate] Clicked publish button: ${publishClicked}`)
 
