@@ -2227,6 +2227,47 @@ export async function validateAndPublishWithWarmSession(
       await delay(500)
     }
 
+    // Check again for "Script is not on the chart" dialog - it may have appeared during the wait
+    const notOnChartRetry = await page.evaluate(() => {
+      const allText = Array.from(document.querySelectorAll('div, span, p'))
+      const notOnChart = allText.find(el => el.textContent?.includes('Script is not on the chart'))
+      if (notOnChart) {
+        const buttons = Array.from(document.querySelectorAll('button'))
+        const addBtn = buttons.find(b => b.textContent?.trim() === 'Add to chart')
+        if (addBtn) {
+          addBtn.click()
+          return 'clicked-add-to-chart'
+        }
+        return 'dialog-found-no-button'
+      }
+      return null
+    })
+    if (notOnChartRetry) {
+      console.log(`[Warm Validate] "Script not on chart" dialog (retry): ${notOnChartRetry}`)
+      if (notOnChartRetry === 'clicked-add-to-chart') {
+        // Wait for script to be added to chart, then re-click publish
+        console.log('[Warm Validate] Waiting for script to be added to chart...')
+        await delay(5000)
+
+        // Re-click the publish button
+        console.log('[Warm Validate] Re-clicking publish button after adding to chart...')
+        const rePublishClicked = await page.evaluate(() => {
+          const shareBtn = document.querySelector('[title*="Share your script" i]') as HTMLElement
+          if (shareBtn && shareBtn.getBoundingClientRect().width > 0) {
+            shareBtn.click()
+            return 'direct-retry'
+          }
+          return null
+        })
+        if (rePublishClicked) {
+          console.log(`[Warm Validate] Re-clicked publish: ${rePublishClicked}`)
+          await delay(3000) // Wait for publish dialog to appear
+        } else {
+          console.log('[Warm Validate] Failed to re-click publish button')
+        }
+      }
+    }
+
     // === STEP 1: Fill title and description (broken into small steps with timeouts) ===
     console.log('[Warm Validate] Step 1: Filling title and description...')
     const { visibilityLevel } = publishOptions
