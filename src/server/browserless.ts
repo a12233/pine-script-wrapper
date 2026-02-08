@@ -160,6 +160,7 @@ export async function createBrowserSession(options?: BrowserSessionOptions): Pro
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       `--user-data-dir=${userDataDir}`,
+      '--remote-debugging-port=9222', // Allow Playwright to connect and observe
     ]
 
     // Launch minimized/hidden by default (unless headless or forceVisible)
@@ -406,23 +407,38 @@ export async function waitForElement(
 }
 
 /**
- * Safe page navigation with error handling
+ * Safe page navigation with error handling and retry.
+ * Defaults to 'domcontentloaded' because TradingView's live data feeds
+ * (websockets, streaming quotes) prevent networkidle from ever resolving.
  */
 export async function navigateTo(
   page: Page,
   url: string,
-  options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2' }
+  options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2'; timeout?: number }
 ): Promise<boolean> {
+  const waitUntil = options?.waitUntil || 'domcontentloaded'
+  const timeout = options?.timeout || 90000
+
+  // First attempt
   try {
-    await page.goto(url, {
-      waitUntil: options?.waitUntil || 'networkidle2',
-      timeout: 60000,
-    })
+    await page.goto(url, { waitUntil, timeout })
     return true
   } catch (error) {
-    console.error(`Navigation to ${url} failed:`, error)
-    return false
+    console.error(`Navigation to ${url} failed (attempt 1, waitUntil=${waitUntil}):`, error)
   }
+
+  // Retry with 'load' as fallback if the first attempt wasn't already 'load'
+  if (waitUntil !== 'load') {
+    try {
+      console.log(`[navigateTo] Retrying ${url} with waitUntil=load...`)
+      await page.goto(url, { waitUntil: 'load', timeout })
+      return true
+    } catch (error) {
+      console.error(`Navigation to ${url} failed (attempt 2, waitUntil=load):`, error)
+    }
+  }
+
+  return false
 }
 
 // ============ Live Session Management (for Admin CAPTCHA solving) ============

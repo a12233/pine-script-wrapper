@@ -37,10 +37,12 @@ Reference these notes for:
 | Feature | /pine/ Page | /chart/ Page |
 |---------|-------------|--------------|
 | Validate script | ✅ Yes | ✅ Yes |
-| Add to chart | ✅ Yes | ✅ Yes |
+| Add to chart | ❌ NO (button not present) | ✅ Yes |
 | **Publish script** | ❌ NO | ✅ **YES** |
 | Has canvas element | ✅ Yes (mini preview) | ✅ Yes (full chart) |
 | Has Monaco editor | ✅ Yes (fullscreen) | ✅ Yes (in panel) |
+
+**2026-01-27 Finding**: The "Add to chart" button does NOT exist on `/pine/` page (confirmed via Playwright, logged in). This means the `/pine/` → "Add to chart" → `/chart/` navigation path documented in the code is not viable. The only reliable ways to get Pine Editor open on `/chart/` are: (1) warm session pre-warmed at startup, or (2) clicking an existing indicator legend.
 
 **Common Pitfall**: The `/pine/` page has a canvas element (mini chart preview), which can trick code into thinking it's on the chart page. ALWAYS check the URL contains `/chart/` before attempting to publish.
 
@@ -65,23 +67,95 @@ The "Publish script" button is ONLY available in the **Pine Editor toolbar on th
 3. The "Publish script" button appears in the Pine Editor's own toolbar
 
 ### Workflow Summary
-- **Validation**: `/pine/` page (fast, has "Add to chart")
+- **Validation**: `/pine/` page for compile checks only (faster load, no "Add to chart")
 - **Publishing**: MUST navigate to `/chart/` page (has "Publish script" button)
 
-The combined validation+publish flow MUST navigate from /pine/ to /chart/ after validation.
+Combined validation+publish paths should prefer staying on `/chart/` end-to-end to avoid unstable cross-page transitions.
 
-### Known Issue: Opening Pine Editor on /chart/
+### Opening Pine Editor on /chart/
 
 When navigating to a fresh `/chart/` page, the Pine Editor panel is NOT open by default.
-Attempts to open it have been problematic:
 
-- `button[aria-label="Pine"]` - May navigate AWAY from `/chart/` to `/pine/` (page reload)
-- `[data-name="open-pine-editor"]` - Not found on fresh `/chart/` page
+**Working selectors:**
+- `[data-name="pine-dialog-button"]` (sidebar toggle) - WORKS, opens Pine Editor panel on `/chart/` without navigating away
+- `[data-name="open-pine-editor"]` - Only exists after Pine Editor has been opened once in the session
+
+**Non-working approaches:**
 - Keyboard shortcuts (Alt+P, Ctrl+,) - Not effective
 
-The Pine Editor only appears reliably when:
-1. You navigate from `/pine/` via "Add to chart" (preserves script context)
-2. You use a pre-warmed session that already has Pine Editor open
-3. You click on an existing indicator legend on the chart
+The code tries `open-pine-editor` first (works on pre-warmed sessions), then falls back to `pine-dialog-button` (works on fresh `/chart/` pages).
 
-This is why the publish flow may fail with "Monaco editor not found".
+## Local Testing with Warm Browser
+
+### Setup
+
+To debug the TradingView automation locally with a visible Chrome browser:
+
+```bash
+# Start dev server with local warm browser (Chrome with GUI)
+USE_WARM_LOCAL_BROWSER=true npm run dev
+```
+
+This will:
+1. Launch a visible Chrome window
+2. Auto-login to TradingView using credentials from Redis
+3. Navigate to the chart page and open Pine Editor
+4. Keep the browser warm for validation requests
+
+### Connecting Playwright MCP for Debugging
+
+1. Get the Chrome debug port:
+   ```bash
+   cat /tmp/puppeteer_dev_chrome_profile-*/DevToolsActivePort | head -1
+   ```
+
+2. View Chrome's debug info:
+   ```
+   http://localhost:<port>/json
+   ```
+
+3. Use Playwright MCP to interact with the local web app:
+   ```
+   Navigate to: http://localhost:3000
+   ```
+
+### Debugging the Publish Dialog
+
+When debugging publish dialog issues:
+
+1. Start the dev server with `USE_WARM_LOCAL_BROWSER=true`
+2. Navigate to `http://localhost:3000` in Playwright
+3. Submit a validation request
+4. Watch the Chrome window to see the TradingView publish dialog
+5. Check terminal output for `[Warm Validate]` logs
+
+### Key Differences: Local vs Production
+
+| Aspect | Local | Production (Fly.io) |
+|--------|-------|---------------------|
+| Browser | Chrome with GUI | Headless Chromium |
+| Visibility | Can see dialogs | Screenshots only |
+| Performance | Faster | Network latency |
+| Debugging | Real-time observation | Log analysis |
+
+### Common Debug Patterns
+
+**Dialog fill timeout**: If the dialog fill times out locally, check:
+- Is the dialog actually visible in Chrome?
+- Are the selectors finding the correct elements?
+- Is TradingView showing any overlay/modal blocking the dialog?
+
+**Script lookup issues**: Check logs for:
+```
+[Warm Validate] Script lookup debug: [...]
+[Warm Validate] Title search failed, trying most recent script with recency check...
+```
+
+### Screenshot Locations
+
+- Local: Screenshots saved to project root
+- Production: `/data/screenshots/` on Fly.io volume
+  ```bash
+  fly ssh console -C "ls -lt /data/screenshots/"
+  fly ssh sftp get /data/screenshots/<filename>.png
+  ```

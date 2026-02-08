@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "vite dev --port 3000",
     "dev:log": "./scripts/dev.sh",
+    "skill:pine-validate": "./skills/pine-validate/scripts/run.sh",
     "build": "vite build",
     "preview": "vite preview",
     "test": "vitest run"

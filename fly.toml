@@ -29,5 +29,5 @@ primary_region = 'iad'
   processes = ['app']
 
 [[vm]]
-  memory = '1024mb'
+  memory = '2048mb'
   cpus = 1

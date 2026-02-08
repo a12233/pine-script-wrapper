@@ -23,13 +23,20 @@ import {
   buildFixPrompt,
   extractPineScript,
 } from './prompts/pine-script-fix'
-import { publishPineScript, validateAndPublishPineScript, validateAndPublishWithWarmSession } from './tradingview'
+import {
+  publishPineScript,
+  validateAndPublishWithWarmSession,
+  parseTVCookies,
+  ensureChartPineEditorOpen,
+} from './tradingview'
+import { createBrowserSession, injectCookies, navigateTo } from './browserless'
 import { startTimer } from './timing'
 import {
   isWarmLocalBrowserEnabled,
   acquireSession,
   releaseSession,
   getSessionStats,
+  waitForPreWarm,
 } from './warm-session'
 
 // OpenRouter client
@@ -173,115 +180,91 @@ async function runValidationLoopInternal(
     return warmResult
   }
 
-  // If publish options provided and no retries needed, use combined function (single browser session)
-  // This saves ~17s by reusing the browser session for both validation and publish
-  if (publishOptions && maxRetries === 1) {
-    console.log(`[ValidationLoop:${requestId}] Using combined validate+publish (single session optimization)`)
-    iterations++
-    console.log(`[ValidationLoop:${requestId}] Iteration ${iterations}: Validating script...`)
-
-    const credentials = await getServiceAccountCredentials()
-    if (!credentials) {
-      timer.end()
-      return {
-        finalScript: currentScript,
-        isValid: false,
-        iterations,
-        fixAttempted: false,
-        fixSuccessful: false,
-        finalErrors: [{
-          line: 0,
-          message: 'Service account authentication failed',
-          type: 'error',
-        }],
-        rawOutput: '',
-        addedToChart: false,
-        publishError: 'Service account authentication failed',
-      }
-    }
-
-    console.log(`[ValidationLoop:${requestId}] publishOptions from caller:`, JSON.stringify(publishOptions))
-    const combinedResult = await validateAndPublishPineScript(credentials, currentScript, {
-      title: publishOptions.title,
-      description: publishOptions.description,
-      visibility: publishOptions.visibility,
-    }, requestId)
-
-    timer.mark('combined validation + publish')
-
-    if (combinedResult.validation.isValid) {
-      console.log(`[ValidationLoop:${requestId}] Script is valid on first attempt`)
-      if (combinedResult.publish) {
-        timer.mark('publish complete')
-        console.log(`[ValidationLoop:${requestId}] Script published successfully: ${combinedResult.publish.indicatorUrl}`)
-      }
-      timer.end()
-      return {
-        finalScript: currentScript,
-        isValid: true,
-        iterations,
-        fixAttempted: false,
-        fixSuccessful: false,
-        finalErrors: [],
-        rawOutput: combinedResult.validation.rawOutput,
-        addedToChart: true,
-        indicatorUrl: combinedResult.publish?.indicatorUrl,
-        publishError: combinedResult.publish?.success === false ? combinedResult.publish.error : undefined,
-      }
-    }
-
-    // Check if this was an infrastructure error (session disconnect, etc.)
-    // If so, fail fast - don't retry with AI fix
-    if (combinedResult.infrastructureError) {
-      console.log(`[ValidationLoop:${requestId}] Infrastructure error - failing fast (no retry)`)
-      timer.end()
-      return {
-        finalScript: currentScript,
-        isValid: false,
-        iterations,
-        fixAttempted: false,
-        fixSuccessful: false,
-        finalErrors: combinedResult.validation.errors,
-        rawOutput: combinedResult.validation.rawOutput,
-        addedToChart: false,
-        publishError: 'Infrastructure error. Please try again.',
-      }
-    }
-
-    // Validation failed due to script errors - attempt AI fix
-    console.log(`[ValidationLoop:${requestId}] Validation failed due to script errors, attempting AI fix...`)
-    lastResult = {
-      ...combinedResult.validation,
-      addedToChart: false,
-    }
-  } else {
-    // Standard flow: validate first, then publish separately
-    iterations++
-    console.log(`[ValidationLoop:${requestId}] Iteration ${iterations}: Validating script...`)
-    lastResult = await validateWithServiceAccount(currentScript)
-    timer.mark('first validation')
-
-    if (lastResult.isValid) {
-      console.log(`[ValidationLoop:${requestId}] Script is valid on first attempt`)
-
-      // If publish options provided, publish the script
-      if (publishOptions) {
-        const publishResult = await publishAfterValidation(currentScript, publishOptions, timer)
+  // If publish options provided, use shared code path (single browser session for validate + publish)
+  if (publishOptions) {
+    console.log(`[ValidationLoop:${requestId}] Using shared validate+publish code path (single session)`)
+    try {
+      const credentials = await getServiceAccountCredentials()
+      if (!credentials) {
+        timer.end()
         return {
           finalScript: currentScript,
-          isValid: true,
-          iterations,
+          isValid: false,
+          iterations: 1,
           fixAttempted: false,
           fixSuccessful: false,
-          finalErrors: [],
-          rawOutput: lastResult.rawOutput,
-          addedToChart: lastResult.addedToChart,
-          indicatorUrl: publishResult.indicatorUrl,
-          publishError: publishResult.error,
+          finalErrors: [{ line: 0, message: 'Service account authentication failed', type: 'error' as const }],
+          rawOutput: '',
+          addedToChart: false,
+          publishError: 'Service account authentication failed',
         }
       }
 
-      timer.end()
+      const session = await createBrowserSession()
+      try {
+        const cookies = parseTVCookies(credentials)
+        await injectCookies(session.page, cookies)
+        await navigateTo(session.page, 'https://www.tradingview.com/chart/')
+        timer.mark('browser setup')
+
+        // Wait for chart page to load
+        await new Promise(resolve => setTimeout(resolve, 5000))
+
+        // Open Pine Editor on /chart/ with strict selector policy.
+        console.log(`[ValidationLoop:${requestId}] Opening Pine Editor on /chart/ page...`)
+        await ensureChartPineEditorOpen(session.page, `ValidationLoop:${requestId}`)
+
+        // Wait for Monaco editor to appear
+        await session.page.waitForSelector('.monaco-editor', { timeout: 15000 })
+        console.log(`[ValidationLoop:${requestId}] Monaco editor loaded, using shared validate+publish path`)
+        timer.mark('pine editor ready')
+
+        const combinedResult = await validateAndPublishWithWarmSession(
+          session.page,
+          currentScript,
+          {
+            title: publishOptions.title,
+            description: publishOptions.description,
+            visibility: publishOptions.visibility,
+          }
+        )
+        timer.mark('validate+publish complete')
+        timer.end()
+
+        const isValid = combinedResult.validation.isValid
+        return {
+          finalScript: currentScript,
+          isValid,
+          iterations: 1,
+          fixAttempted: false,
+          fixSuccessful: false,
+          finalErrors: isValid ? [] : (combinedResult.validation.errors || []),
+          rawOutput: combinedResult.validation.rawOutput || '',
+          addedToChart: isValid,
+          indicatorUrl: combinedResult.publish?.indicatorUrl,
+          publishError: combinedResult.publish?.error,
+        }
+      } finally {
+        try { await session.browser.close() } catch (_e) { /* ignore */ }
+      }
+    } catch (error) {
+      console.error(`[ValidationLoop:${requestId}] Shared path failed, falling back to separate sessions:`, error)
+      // Fall through to the separate validation path below
+    }
+  }
+
+  // Validate script first, then publish separately if needed (fallback path)
+  iterations++
+  console.log(`[ValidationLoop:${requestId}] Iteration ${iterations}: Validating script...`)
+  lastResult = await validateWithServiceAccount(currentScript)
+  timer.mark('first validation')
+
+  if (lastResult.isValid) {
+    console.log(`[ValidationLoop:${requestId}] Script is valid on first attempt`)
+
+    // If publish options provided, publish the script (fallback: separate session)
+    if (publishOptions) {
+      const publishResult = await publishAfterValidation(currentScript, publishOptions, timer)
       return {
         finalScript: currentScript,
         isValid: true,
@@ -291,7 +274,21 @@ async function runValidationLoopInternal(
         finalErrors: [],
         rawOutput: lastResult.rawOutput,
         addedToChart: lastResult.addedToChart,
+        indicatorUrl: publishResult.indicatorUrl,
+        publishError: publishResult.error,
       }
+    }
+
+    timer.end()
+    return {
+      finalScript: currentScript,
+      isValid: true,
+      iterations,
+      fixAttempted: false,
+      fixSuccessful: false,
+      finalErrors: [],
+      rawOutput: lastResult.rawOutput,
+      addedToChart: lastResult.addedToChart,
     }
   }
 
@@ -390,6 +387,10 @@ async function runValidationLoopWithWarmSession(
   let fixSuccessful = false
   let lastResult: FullValidationResult | null = null
 
+  // Wait for pre-warm to complete (if running)
+  await waitForPreWarm()
+  timer.mark('pre-warm complete')
+
   // Get service account credentials
   const credentials = await getServiceAccountCredentials()
   if (!credentials) {
@@ -447,7 +448,11 @@ async function runValidationLoopWithWarmSession(
 
       if (combinedResult.publish) {
         timer.mark('publish complete')
-        console.log(`[ValidationLoop/Warm:${requestId}] Script published: ${combinedResult.publish.indicatorUrl}`)
+        if (combinedResult.publish.success) {
+          console.log(`[ValidationLoop/Warm:${requestId}] Script published: ${combinedResult.publish.indicatorUrl}`)
+        } else {
+          console.log(`[ValidationLoop/Warm:${requestId}] Publish error: ${combinedResult.publish.error}`)
+        }
       }
 
       timer.end()
@@ -519,7 +524,11 @@ async function runValidationLoopWithWarmSession(
 
             if (retryResult.publish) {
               timer.mark('publish complete')
-              console.log(`[ValidationLoop/Warm:${requestId}] Script published: ${retryResult.publish.indicatorUrl}`)
+              if (retryResult.publish.success) {
+                console.log(`[ValidationLoop/Warm:${requestId}] Script published: ${retryResult.publish.indicatorUrl}`)
+              } else {
+                console.log(`[ValidationLoop/Warm:${requestId}] Publish error: ${retryResult.publish.error}`)
+              }
             }
 
             timer.end()

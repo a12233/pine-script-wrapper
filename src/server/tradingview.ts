@@ -168,6 +168,7 @@ export const TV_SELECTORS = {
   chart: {
     container: '.chart-container',
     pineEditorButton: '[data-name="open-pine-editor"]',
+    pineDialogButton: '[data-name="pine-dialog-button"]', // Sidebar toggle (always exists on fresh /chart/)
   },
   // Dedicated /pine/ editor page (simpler, faster loading)
   pineEditorPage: {
@@ -187,6 +188,128 @@ export const TV_SELECTORS = {
   // Version info
   version: '2024-01',
 } as const
+
+type TVPageType = 'chart' | 'pine' | 'signin' | 'unknown'
+
+const STRICT_SELECTORS = {
+  pineOpenButton: [
+    TV_SELECTORS.chart.pineEditorButton,      // [data-name="open-pine-editor"] (exists after first open)
+    TV_SELECTORS.chart.pineDialogButton,       // Sidebar toggle (always exists on fresh /chart/)
+  ],
+  pineEditorReady: [TV_SELECTORS.pineEditor.container, TV_SELECTORS.pineEditor.editorArea],
+  publishButtons: [
+    '[data-name="publish-script-button"]',
+    '[data-name="save-publish-button"]',
+    '[title*="Share your script" i]',
+  ],
+} as const
+
+function getPageTypeFromUrl(url: string): TVPageType {
+  if (url.includes('/chart/')) return 'chart'
+  if (url.includes('/pine/')) return 'pine'
+  if (url.includes('/signin') || url.includes('/login')) return 'signin'
+  return 'unknown'
+}
+
+export function detectTVPageFromUrl(url: string): TVPageType {
+  return getPageTypeFromUrl(url)
+}
+
+export async function ensureChartContext(
+  page: import('puppeteer-core').Page,
+  requestTag: string = 'TV Nav'
+): Promise<void> {
+  const initialType = getPageTypeFromUrl(page.url())
+  if (initialType !== 'chart') {
+    console.log(`[${requestTag}] Enforcing chart context from ${page.url()}`)
+    const navigated = await navigateTo(page, TV_URLS.chart)
+    if (!navigated) {
+      throw new Error('Failed to navigate to /chart/ page')
+    }
+    await delay(1500)
+  }
+}
+
+export async function ensureChartPineEditorOpen(
+  page: import('puppeteer-core').Page,
+  requestTag: string = 'TV Nav'
+): Promise<void> {
+  await ensureChartContext(page, requestTag)
+
+  const alreadyOpen = await page.$(TV_SELECTORS.pineEditor.container)
+  if (alreadyOpen) {
+    await waitForElement(page, TV_SELECTORS.pineEditor.editorArea, 10000)
+    return
+  }
+
+  let opened = false
+  for (const selector of STRICT_SELECTORS.pineOpenButton) {
+    try {
+      const button = await page.$(selector)
+      if (!button) continue
+      await button.click()
+      await delay(800)
+      await ensureChartContext(page, requestTag)
+      const ready = await waitForElement(page, TV_SELECTORS.pineEditor.editorArea, 8000)
+      if (ready) {
+        opened = true
+        console.log(`[${requestTag}] Pine Editor opened via ${selector}`)
+        break
+      }
+    } catch {
+      // Try next strict selector.
+    }
+  }
+
+  if (!opened) {
+    // Last strict fallback: click an existing legend source (if present) to open Pine panel.
+    const legendOpened = await page.evaluate(() => {
+      const item = document.querySelector('[data-name="legend-source-item"]') as HTMLElement | null
+      if (!item) return false
+      item.click()
+      return true
+    }).catch(() => false)
+
+    if (legendOpened) {
+      await delay(1000)
+      await ensureChartContext(page, requestTag)
+      opened = await waitForElement(page, TV_SELECTORS.pineEditor.editorArea, 8000)
+      if (opened) {
+        console.log(`[${requestTag}] Pine Editor opened via legend fallback`)
+      }
+    }
+  }
+
+  if (!opened) {
+    throw new Error('Could not open Pine Editor on /chart/ with strict selectors')
+  }
+}
+
+export async function clickPublishButtonInChart(
+  page: import('puppeteer-core').Page,
+  requestTag: string = 'TV Publish'
+): Promise<string | null> {
+  await ensureChartContext(page, requestTag)
+  await ensureChartPineEditorOpen(page, requestTag)
+
+  for (const selector of STRICT_SELECTORS.publishButtons) {
+    const clicked = await page.evaluate((sel) => {
+      const btn = document.querySelector(sel) as HTMLElement | null
+      if (!btn) return null
+      const rect = btn.getBoundingClientRect()
+      if (rect.width <= 0 || rect.height <= 0) return null
+      btn.click()
+      return sel
+    }, selector).catch(() => null)
+
+    if (clicked) {
+      await ensureChartContext(page, requestTag)
+      return clicked
+    }
+  }
+
+  return null
+}
 
 export interface TVCredentials {
   sessionId: string
@@ -208,6 +331,62 @@ export interface PublishResult {
   success: boolean
   indicatorUrl?: string
   error?: string
+  errorCode?: 'URL_CAPTURE_FAILED_AFTER_PUBLISH' | 'PUBLISH_ACTION_FAILED'
+  publishedButUrlUnknown?: boolean
+  captureSource?: 'new-tab' | 'network-id' | 'redirect' | 'dom' | 'scripts-api'
+}
+
+interface ScriptApiResultItem {
+  name?: string
+  chart_url?: string
+  url?: string
+  image_url?: string
+}
+
+const URL_CAPTURE_WINDOW_MS = 60000
+const API_LOOKUP_ELAPSED_SCHEDULE_MS = [0, 2000, 5000, 9000, 14000, 20000, 27000, 35000, 45000, 55000] as const
+
+export function resolveScriptsApiUsername(
+  env: NodeJS.ProcessEnv = process.env
+): string | null {
+  const raw = env.TV_SERVICE_ACCOUNT_USERNAME || env.TV_USERNAME
+  const username = raw?.trim()
+  return username ? username : null
+}
+
+export function extractScriptIdFromText(text: string): string | null {
+  if (!text) return null
+  const idMatch = text.match(/"scriptIdPart"\s*:\s*"([a-zA-Z0-9]+)"/) ||
+                  text.match(/"scriptId"\s*:\s*"([a-zA-Z0-9]+)"/) ||
+                  text.match(/"script_id"\s*:\s*"([a-zA-Z0-9]+)"/) ||
+                  text.match(/"idScript"\s*:\s*"([a-zA-Z0-9]+)"/) ||
+                  text.match(/"id"\s*:\s*"([a-zA-Z0-9]+)"/) ||
+                  text.match(/\/script\/([a-zA-Z0-9]+)/) ||
+                  text.match(/"publishedUrl"\s*:\s*"[^"]*\/script\/([a-zA-Z0-9]+)/)
+  return idMatch ? idMatch[1] : null
+}
+
+export function extractScriptIdFromUrl(url: string): string | null {
+  const match = url.match(/tradingview\.com\/script\/([a-zA-Z0-9]+)/i) ||
+                url.match(/\/script\/([a-zA-Z0-9]+)/i)
+  return match ? match[1] : null
+}
+
+export function canonicalizeTradingViewScriptUrl(url: string | null | undefined): string | null {
+  if (!url) return null
+  const scriptId = extractScriptIdFromUrl(url)
+  if (!scriptId) return null
+  return `https://www.tradingview.com/script/${scriptId}/`
+}
+
+export function selectExactTitleMatchScriptUrl(
+  expectedTitle: string,
+  results: ScriptApiResultItem[]
+): string | null {
+  const normalizedTitle = expectedTitle.trim().toLowerCase()
+  const match = results.find((item) => item.name?.trim().toLowerCase() === normalizedTitle)
+  if (!match) return null
+  return canonicalizeTradingViewScriptUrl(match.chart_url || match.url || (match.image_url ? `https://www.tradingview.com/script/${match.image_url}/` : null))
 }
 
 /**
@@ -685,126 +864,9 @@ export async function validatePineScript(
       throw new Error('Failed to navigate to TradingView')
     }
 
-    console.log('[TV] Checking if Pine Editor is already open...')
-    await delay(3000) // Wait for page to fully load
-
-    // Check if Pine Editor is already open
-    const pineEditorVisible = await waitForElement(page, TV_SELECTORS.pineEditor.container, 5000)
-    if (!pineEditorVisible) {
-      console.log('[TV] Pine Editor not open, looking for open button...')
-
-      // Try multiple selectors for the Pine Editor button
-      const editorButtonSelectors = [
-        '[data-name="open-pine-editor"]',
-        'button[title="Pine"]',
-        'button[aria-label="Pine"]',
-        'button[title*="Pine"]',
-        'button[aria-label*="Pine"]',
-        '[data-role="button"][title*="Pine"]',
-      ]
-
-      let buttonFound = false
-      for (const selector of editorButtonSelectors) {
-        try {
-          const button = await page.$(selector)
-          if (button) {
-            console.log(`[TV] Found Pine Editor button with selector: ${selector}`)
-            await button.click()
-            buttonFound = true
-            break
-          }
-        } catch (e) {
-          console.log(`[TV] Selector ${selector} failed, trying next...`)
-        }
-      }
-
-      if (!buttonFound) {
-        // Debug: log all buttons with their attributes
-        console.log('[TV] Trying to find Pine Editor button by text and attributes...')
-        const buttonInfo = await page.evaluate(() => {
-          const buttons = Array.from(document.querySelectorAll('button, div[role="button"]'))
-          return buttons.slice(0, 20).map((btn, i) => ({
-            index: i,
-            text: btn.textContent?.trim().substring(0, 50),
-            title: btn.getAttribute('title'),
-            ariaLabel: btn.getAttribute('aria-label'),
-            dataName: btn.getAttribute('data-name'),
-            className: btn.className.substring(0, 50),
-          }))
-        })
-        console.log('[TV] Found buttons:', JSON.stringify(buttonInfo, null, 2))
-
-        // Try finding by title attribute containing "Pine"
-        const clicked = await page.evaluate(() => {
-          const buttons = Array.from(document.querySelectorAll('button, div[role="button"], [role="button"]'))
-          const pineBtn = buttons.find(btn => {
-            const title = btn.getAttribute('title')
-            const ariaLabel = btn.getAttribute('aria-label')
-            return (title && title.toLowerCase().includes('pine')) ||
-                   (ariaLabel && ariaLabel.toLowerCase().includes('pine'))
-          })
-          if (pineBtn) {
-            (pineBtn as HTMLElement).click()
-            return true
-          }
-          return false
-        })
-
-        if (clicked) {
-          console.log('[TV] Clicked Pine button via title/aria-label search')
-          buttonFound = true
-        }
-      }
-
-      // Wait for Pine Editor to appear - try all selectors in parallel
-      console.log('[TV] Waiting for Pine Editor to load...')
-
-      // Try multiple selectors for Pine Editor container - in parallel
-      const pineEditorSelectors = [
-        '[data-name="pine-editor"]',
-        '.pine-editor-container',
-        '[data-role="panel-Pine"]',
-        '[id*="pine"]',
-        '.monaco-editor', // The code editor itself
-      ]
-
-      // Race all selectors - first one to match wins
-      let editorOpened = false
-      const selectorPromises = pineEditorSelectors.map(async (selector) => {
-        const found = await waitForElement(page, selector, 15000)
-        if (found) return selector
-        return null
-      })
-
-      const winningSelector = await Promise.race([
-        Promise.any(selectorPromises.map(p => p.then(s => s ? s : Promise.reject()))).catch(() => null),
-        delay(15000).then(() => null), // Overall timeout
-      ])
-
-      if (winningSelector) {
-        console.log(`[TV] Pine Editor found with selector: ${winningSelector}`)
-        editorOpened = true
-      }
-
-      if (!editorOpened) {
-        // Log what's actually on the page
-        const pageInfo = await page.evaluate(() => {
-          return {
-            panels: Array.from(document.querySelectorAll('[data-role*="panel"]')).map(el => el.getAttribute('data-role')),
-            dataNames: Array.from(document.querySelectorAll('[data-name]')).slice(0, 20).map(el => el.getAttribute('data-name')),
-          }
-        })
-        console.log('[TV] Page elements:', JSON.stringify(pageInfo, null, 2))
-
-        // Take screenshot for debugging
-        await page.screenshot({ path: `${SCREENSHOT_DIR}/tv-pine-editor-not-found.png` })
-        console.log(`[TV] Screenshot saved to ${SCREENSHOT_DIR}/tv-pine-editor-not-found.png`)
-        throw new Error('Could not open Pine Editor - please check screenshot')
-      }
-      console.log('[TV] Pine Editor opened successfully')
-    } else {
-      console.log('[TV] Pine Editor already open')
-    }
+    console.log('[TV] Enforcing /chart/ context and opening Pine Editor...')
+    await delay(1500)
+    await ensureChartPineEditorOpen(page, 'TV Validate')
 
     // Wait for Monaco editor to be ready
     console.log('[TV] Waiting for Monaco editor...')
@@ -1243,43 +1305,77 @@ async function clickFinalPublishButton(
   const expectedText = privacy === 'public' ? 'Publish public script' : 'Publish private script'
   console.log(`[TV Publish Helper] Looking for "${expectedText}" button...`)
 
-  // Use page.evaluate for more reliable button search
+  // Use page.evaluate for reliable dialog-scoped search and exact text matching only.
   const clicked = await Promise.race([
     page.evaluate((expected: string) => {
-      const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'))
-        .filter(el => (el as HTMLElement).getBoundingClientRect().width > 0)
+      // Scope strictly to visible publish dialog containers first.
+      const dialogs = Array.from(
+        document.querySelectorAll('[data-dialog-name="publish-script"], [class*="dialog"], [role="dialog"]')
+      ).filter((el) => {
+        const rect = (el as HTMLElement).getBoundingClientRect()
+        return rect.width > 0 && rect.height > 0
+      })
 
-      // Try exact text match first
-      for (const btn of buttons) {
-        const text = btn.textContent?.trim().toLowerCase() || ''
-        if (text === expected.toLowerCase()) {
-          (btn as HTMLElement).click()
-          return `exact:${btn.textContent?.trim()}`
+      const getVisibleButtons = (root: ParentNode) =>
+        Array.from(root.querySelectorAll('button, [role="button"], input[type="submit"]'))
+          .filter(el => (el as HTMLElement).getBoundingClientRect().width > 0)
+
+      const clickButton = (btn: Element, matchType: string): string => {
+        ;(btn as HTMLElement).click()
+        const text = btn.textContent?.trim() || ''
+        const tag = btn.tagName.toLowerCase()
+        const role = (btn as HTMLElement).getAttribute('role') || ''
+        return `${matchType}:${text}:tag=${tag}:role=${role || 'none'}:dialogScoped=true`
+      }
+
+      const findAndClick = (root: ParentNode): string | null => {
+        const buttons = getVisibleButtons(root)
+
+        // Try exact match first
+        for (const btn of buttons) {
+          const text = btn.textContent?.trim() || ''
+          if (text.toLowerCase() === expected.toLowerCase()) {
+            return clickButton(btn, 'exact')
+          }
         }
-      }
-
-      // Try partial match - "publish" in text
-      for (const btn of buttons) {
-        const text = btn.textContent?.trim().toLowerCase() || ''
-        if (text.includes('publish') && !text.includes('unpublish')) {
-          (btn as HTMLElement).click()
-          return `partial:${btn.textContent?.trim()}`
+        // Fallback: any button starting with "Publish" containing "script"
+        for (const btn of buttons) {
+          const text = btn.textContent?.trim().toLowerCase() || ''
+          if (text.startsWith('publish') && text.includes('script')) {
+            return clickButton(btn, 'partial')
+          }
         }
+        return null
       }
 
-      // Try submit button
-      const submitBtn = document.querySelector('button[type="submit"]') as HTMLElement
-      if (submitBtn && submitBtn.getBoundingClientRect().width > 0) {
-        submitBtn.click()
-        return 'submit-button'
+      for (const dialog of dialogs) {
+        const clicked = findAndClick(dialog)
+        if (clicked) return clicked
       }
 
-      // Debug: list all visible buttons
-      const visibleBtns = buttons
-        .map(b => b.textContent?.trim().slice(0, 40))
-        .filter(t => t && t.length > 0)
-        .slice(0, 15)
-      return `NOT_FOUND:buttons=[${visibleBtns.join('|')}]`
+      // Last fallback: no dialog found, search whole document.
+      if (dialogs.length === 0) {
+        const clicked = findAndClick(document)
+        if (clicked) return clicked
+      }
+
+      const visibleBtnsInDialogs = dialogs
+        .flatMap((dialog) =>
+          Array.from(dialog.querySelectorAll('button, [role="button"], input[type="submit"]'))
+            .filter((el) => (el as HTMLElement).getBoundingClientRect().width > 0)
+            .map((el) => (el.textContent?.trim() || '(no-text)').slice(0, 50))
+        )
+        .slice(0, 20)
+
+      if (dialogs.length > 0) {
+        return `NOT_FOUND_DIALOG_SCOPED:expected=${expected}:buttons=[${visibleBtnsInDialogs.join('|')}]`
+      }
+
+      const visibleBtns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'))
+        .filter((el) => (el as HTMLElement).getBoundingClientRect().width > 0)
+        .map((el) => (el.textContent?.trim() || '(no-text)').slice(0, 50))
+        .slice(0, 20)
+      return `NOT_FOUND_NO_DIALOG:expected=${expected}:buttons=[${visibleBtns.join('|')}]`
     }, expectedText),
     new Promise<string>((r) => setTimeout(() => r('TIMEOUT'), 10000)),
   ])
@@ -1289,8 +1385,185 @@ async function clickFinalPublishButton(
     return true
   }
 
-  console.log(`[TV Publish Helper] Warning: Could not find final publish button: ${clicked}`)
+  console.log(`[TV Publish Helper] Warning: Could not find exact final publish button: ${clicked}`)
   return false
+}
+
+interface CapturePublishedScriptUrlOptions {
+  logTag: string
+  title: string
+  captureWindowMs?: number
+}
+
+async function capturePublishedScriptUrl(
+  page: import('puppeteer-core').Page,
+  options: CapturePublishedScriptUrlOptions
+): Promise<{ url?: string; source?: PublishResult['captureSource'] }> {
+  const captureWindowMs = options.captureWindowMs || URL_CAPTURE_WINDOW_MS
+  const startedAt = Date.now()
+  const deadline = startedAt + captureWindowMs
+  console.log(`[${options.logTag}] Starting script URL capture (${captureWindowMs}ms budget)`)
+  const serviceAccountUsername = resolveScriptsApiUsername()
+  if (!serviceAccountUsername) {
+    console.log(`[${options.logTag}] TV_SERVICE_ACCOUNT_USERNAME/TV_USERNAME is not set; skipping scripts API lookup`)
+  }
+  let capturedScriptId: string | null = null
+  let newTabUrl: string | null = null
+  let apiAttempt = 0
+
+  const responseHandler = async (response: import('puppeteer-core').HTTPResponse) => {
+    try {
+      const url = response.url()
+      const status = response.status()
+      const isRelevantUrl = (
+        url.includes('tradingview.com') &&
+        (url.includes('pine-facade') || url.includes('/publish') || url.includes('/save') || url.includes('/create') || url.includes('/script') || url.includes('/api/'))
+      )
+
+      if (!isRelevantUrl || status < 200 || status >= 300 || capturedScriptId) return
+      const text = await response.text().catch(() => '')
+      const extracted = extractScriptIdFromText(text) || extractScriptIdFromUrl(url)
+      if (extracted) {
+        capturedScriptId = extracted
+        console.log(`[${options.logTag}] Captured script ID from network: ${capturedScriptId}`)
+      }
+    } catch {
+      // Ignore per-response parsing errors
+    }
+  }
+
+  page.on('response', responseHandler)
+
+  const browser = page.browser()
+  let newPageListener: ((target: import('puppeteer-core').Target) => Promise<void>) | null = null
+  let newPageTimeout: NodeJS.Timeout | null = null
+
+  const newPagePromise = new Promise<void>((resolve) => {
+    newPageTimeout = setTimeout(() => {
+      resolve()
+    }, captureWindowMs)
+
+    newPageListener = async (target) => {
+      if (target.type() !== 'page') return
+      try {
+        const newPage = await target.page()
+        if (!newPage) return
+        await newPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {})
+        await delay(500)
+        newTabUrl = canonicalizeTradingViewScriptUrl(newPage.url())
+        if (newTabUrl) {
+          console.log(`[${options.logTag}] Captured script URL from new tab: ${newTabUrl}`)
+        }
+        await newPage.close().catch(() => {})
+      } catch {
+        // Ignore new tab errors
+      } finally {
+        resolve()
+      }
+    }
+
+    browser?.once('targetcreated', newPageListener)
+  })
+
+  try {
+    while (Date.now() < deadline) {
+      if (newTabUrl) return { url: newTabUrl, source: 'new-tab' }
+
+      if (capturedScriptId) {
+        return {
+          url: `https://www.tradingview.com/script/${capturedScriptId}/`,
+          source: 'network-id',
+        }
+      }
+
+      const redirectUrl = canonicalizeTradingViewScriptUrl(page.url())
+      if (redirectUrl) {
+        console.log(`[${options.logTag}] Captured redirect URL: ${redirectUrl}`)
+        return { url: redirectUrl, source: 'redirect' }
+      }
+
+      const domUrlRaw = await page.evaluate(() => {
+        const toasts = document.querySelectorAll('[class*="toast"], [class*="notification"], [class*="snackbar"], [data-name*="toast"]')
+        for (const toast of toasts) {
+          const link = toast.querySelector('a[href*="/script/"]') as HTMLAnchorElement | null
+          if (link?.href) return link.href
+        }
+
+        const links = Array.from(document.querySelectorAll('a[href*="/script/"]'))
+        for (const link of links) {
+          const href = (link as HTMLAnchorElement).href
+          if (href.includes('tradingview.com/script/')) return href
+        }
+
+        const bodyText = document.body?.innerText || ''
+        const match = bodyText.match(/tradingview\.com\/script\/([a-zA-Z0-9]+)/)
+        if (match) return `https://www.tradingview.com/script/${match[1]}/`
+        return null
+      }).catch(() => null)
+      const domUrl = canonicalizeTradingViewScriptUrl(domUrlRaw)
+      if (domUrl) {
+        console.log(`[${options.logTag}] Captured URL from DOM: ${domUrl}`)
+        return { url: domUrl, source: 'dom' }
+      }
+
+      const now = Date.now()
+      const elapsedMs = now - startedAt
+      const isScheduledApiAttempt = (
+        serviceAccountUsername &&
+        apiAttempt < API_LOOKUP_ELAPSED_SCHEDULE_MS.length &&
+        elapsedMs >= API_LOOKUP_ELAPSED_SCHEDULE_MS[apiAttempt]
+      )
+
+      if (isScheduledApiAttempt) {
+        apiAttempt += 1
+        console.log(
+          `[${options.logTag}] Scripts API lookup attempt ${apiAttempt}/${API_LOOKUP_ELAPSED_SCHEDULE_MS.length} at ${elapsedMs}ms`
+        )
+        const apiResults = await page.evaluate(async ({ username, expectedTitle }) => {
+          try {
+            const encodedTitle = encodeURIComponent(expectedTitle)
+            const res = await fetch(`https://www.tradingview.com/api/v1/scripts/?page=1&per_page=10&by=${username}&q=${encodedTitle}`)
+            if (!res.ok) return []
+            const data = await res.json()
+            if (!Array.isArray(data?.results)) return []
+            return data.results.slice(0, 10)
+          } catch {
+            return []
+          }
+        }, { username: serviceAccountUsername, expectedTitle: options.title })
+
+        const canonicalApiUrl = selectExactTitleMatchScriptUrl(options.title, apiResults as ScriptApiResultItem[])
+        if (canonicalApiUrl) {
+          console.log(`[${options.logTag}] Captured URL from scripts API exact match: ${canonicalApiUrl}`)
+          return { url: canonicalApiUrl, source: 'scripts-api' }
+        }
+        console.log(`[${options.logTag}] Scripts API attempt ${apiAttempt}: no exact title match (results=${apiResults.length})`)
+      }
+
+      await delay(500)
+    }
+
+    await newPagePromise.catch(() => {})
+    if (newTabUrl) return { url: newTabUrl, source: 'new-tab' }
+    if (capturedScriptId) {
+      return {
+        url: `https://www.tradingview.com/script/${capturedScriptId}/`,
+        source: 'network-id',
+      }
+    }
+    console.log(
+      `[${options.logTag}] Script URL capture exhausted after ${Date.now() - startedAt}ms (apiAttempts=${apiAttempt})`
+    )
+    return {}
+  } finally {
+    page.off('response', responseHandler)
+    if (newPageListener && browser) {
+      browser.off('targetcreated', newPageListener)
+    }
+    if (newPageTimeout) {
+      clearTimeout(newPageTimeout)
+    }
+  }
 }
 
 /**
@@ -1328,43 +1601,8 @@ export async function publishPineScript(
     console.log('[TV Publish] Navigated to chart, waiting for page load...')
     await delay(1500)
 
-    // Open Pine Editor if not already open
-    const pineEditorVisible = await waitForElement(page, TV_SELECTORS.pineEditor.container, 5000)
-    if (!pineEditorVisible) {
-      console.log('[TV Publish] Pine Editor not open, looking for button...')
-
-      // Try to find and click Pine Editor button (same logic as validation)
-      const clicked = await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('button, div[role="button"], [role="button"]'))
-        const pineBtn = buttons.find(btn => {
-          const title = btn.getAttribute('title')
-          const ariaLabel = btn.getAttribute('aria-label')
-          return (title && title.toLowerCase().includes('pine')) ||
-                 (ariaLabel && ariaLabel.toLowerCase().includes('pine'))
-        })
-        if (pineBtn) {
-          (pineBtn as HTMLElement).click()
-          return true
-        }
-        return false
-      })
-
-      if (clicked) {
-        console.log('[TV Publish] Clicked Pine button')
-        await delay(2000) // Wait for editor to load
-
-        // Verify it opened
-        const editorOpened = await waitForElement(page, '.monaco-editor', 10000)
-        if (!editorOpened) {
-          throw new Error('Pine Editor did not open')
-        }
-        console.log('[TV Publish] Pine Editor opened successfully')
-      } else {
-        throw new Error('Could not find Pine Editor button')
-      }
-    } else {
-      console.log('[TV Publish] Pine Editor already open')
-    }
+    await ensureChartPineEditorOpen(page, 'TV Publish')
+    console.log('[TV Publish] Pine Editor ready on /chart/')
 
     // Insert script via clipboard paste
     console.log('[TV Publish] Inserting script via clipboard paste...')
@@ -1432,51 +1670,9 @@ export async function publishPineScript(
     // Wait for script to be added to chart and verified
     await delay(1500)
 
-    // Click publish button with multiple selector fallbacks
+    // Click publish button with strict selector allowlist
     console.log('[TV Publish] Looking for publish button...')
-    const publishButtonSelectors = [
-      TV_SELECTORS.publish.button,
-      '[data-name="publish-script-button"]',
-      '[data-name="save-publish-button"]',
-      '[aria-label*="Publish" i]',
-      '[title*="Publish" i]',
-      'button[class*="publish" i]',
-    ]
-
-    let publishClicked = false
-    for (const selector of publishButtonSelectors) {
-      try {
-        const btn = await page.$(selector)
-        if (btn) {
-          await btn.click()
-          publishClicked = true
-          console.log(`[TV Publish] Clicked publish button: ${selector}`)
-          break
-        }
-      } catch {
-        // Try next selector
-      }
-    }
-
-    if (!publishClicked) {
-      // Fallback: search by text content
-      publishClicked = await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('button, [role="button"]'))
-        const publishBtn = buttons.find(btn => {
-          const text = btn.textContent?.toLowerCase() || ''
-          const ariaLabel = btn.getAttribute('aria-label')?.toLowerCase() || ''
-          return text.includes('publish') || ariaLabel.includes('publish')
-        })
-        if (publishBtn) {
-          (publishBtn as HTMLElement).click()
-          return true
-        }
-        return false
-      })
-      if (publishClicked) {
-        console.log('[TV Publish] Clicked publish button via text search')
-      }
-    }
+    const publishClicked = await clickPublishButtonInChart(page, 'TV Publish')
 
     if (!publishClicked) {
       // Take screenshot for debugging
@@ -1484,6 +1680,7 @@ export async function publishPineScript(
       console.log(`[TV Publish] Screenshot saved to ${SCREENSHOT_DIR}/tv-chart-publish-no-button.png`)
       throw new Error('Could not find publish button')
     }
+    console.log(`[TV Publish] Clicked publish button: ${publishClicked}`)
 
     // Wait for publish dialog
     const dialogFound = await waitForElement(page, TV_SELECTORS.publish.dialog, 10000)
@@ -1532,25 +1729,6 @@ export async function publishPineScript(
 
     await delay(200)
 
-    // Set up listener for new tabs (TradingView opens published script in new tab)
-    const browser = page.browser()
-    let newScriptPage: typeof page | null = null
-
-    const newPagePromise = new Promise<typeof page | null>((resolve) => {
-      const timeout = setTimeout(() => resolve(null), 15000) // 15s timeout
-      browser.once('targetcreated', async (target) => {
-        if (target.type() === 'page') {
-          clearTimeout(timeout)
-          const newPage = await target.page()
-          if (newPage) {
-            resolve(newPage)
-          } else {
-            resolve(null)
-          }
-        }
-      })
-    })
-
     // Final submit using helper function
     console.log('[TV Publish] Clicking final Publish button...')
     const submitted = await clickFinalPublishButton(page, visibility)
@@ -1562,148 +1740,34 @@ export async function publishPineScript(
       throw new Error('Could not find final Publish button in step 2')
     }
 
-    // Wait for publish to complete and try to get the indicator URL
-    console.log('[TV Publish] Waiting for publish to complete...')
+    const captured = await capturePublishedScriptUrl(page, {
+      logTag: 'TV Publish',
+      title,
+      captureWindowMs: URL_CAPTURE_WINDOW_MS,
+    })
 
-    // First, wait for and check the new tab that TradingView opens
-    console.log('[TV Publish] Waiting for new tab with published script...')
-    newScriptPage = await newPagePromise
-
-    if (newScriptPage) {
-      // Wait for the new page to load
-      try {
-        await newScriptPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {})
-        await delay(1000)
-        const newTabUrl = newScriptPage.url()
-        console.log(`[TV Publish] New tab opened: ${newTabUrl}`)
-
-        if (newTabUrl.includes('/script/')) {
-          console.log(`[TV Publish] Found script URL in new tab: ${newTabUrl}`)
-          // Close the new tab since we got the URL
-          await newScriptPage.close().catch(() => {})
-          return {
-            success: true,
-            indicatorUrl: newTabUrl,
-          }
-        }
-        // Close the new tab if it wasn't the script page
-        await newScriptPage.close().catch(() => {})
-      } catch (e) {
-        console.log('[TV Publish] Error checking new tab:', e)
-      }
-    } else {
-      console.log('[TV Publish] No new tab detected, checking current page...')
-    }
-
-    // Fallback: Try multiple times to find the indicator URL in current page
-    for (let attempt = 0; attempt < 3; attempt++) {
-      await delay(2000)
-
-      // Check if we got redirected to the script page
-      const currentUrl = page.url()
-      console.log(`[TV Publish] Attempt ${attempt + 1}: Current URL: ${currentUrl}`)
-
-      const indicatorMatch = currentUrl.match(/tradingview\.com\/script\/([^/]+)/)
-      if (indicatorMatch) {
-        console.log('[TV Publish] Found script URL in redirect!')
-        return {
-          success: true,
-          indicatorUrl: `https://www.tradingview.com/script/${indicatorMatch[1]}/`,
-        }
-      }
-
-      // Try to find URL in the page (success message, link, etc.)
-      const indicatorUrl = await page.evaluate(() => {
-        // Look for script link anywhere on the page
-        const links = Array.from(document.querySelectorAll('a[href*="/script/"]'))
-        for (const link of links) {
-          const href = (link as HTMLAnchorElement).href
-          if (href.includes('tradingview.com/script/')) {
-            return href
-          }
-        }
-
-        // Look for success message containing URL
-        const successText = document.body.innerText
-        const urlMatch = successText.match(/tradingview\.com\/script\/([a-zA-Z0-9]+)/)
-        if (urlMatch) {
-          return `https://www.tradingview.com/script/${urlMatch[1]}/`
-        }
-
-        return null
-      })
-
-      if (indicatorUrl) {
-        console.log(`[TV Publish] Found script URL in page: ${indicatorUrl}`)
-        return {
-          success: true,
-          indicatorUrl,
-        }
-      }
-
-      // Check if publish dialog closed (might indicate success)
-      const dialogStillOpen = await page.evaluate(() => {
-        return !!document.querySelector('[data-dialog-name="publish-script"], [class*="publish-dialog"]')
-      })
-
-      if (!dialogStillOpen && attempt > 0) {
-        console.log('[TV Publish] Dialog closed, publish may have succeeded')
+    if (captured.url) {
+      return {
+        success: true,
+        indicatorUrl: captured.url,
+        captureSource: captured.source,
       }
     }
 
-    // Take screenshot for debugging
-    await page.screenshot({ path: `${SCREENSHOT_DIR}/tv-publish-no-url.png` })
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tv-publish-no-url.png` }).catch(() => {})
     console.log(`[TV Publish] Screenshot saved to ${SCREENSHOT_DIR}/tv-publish-no-url.png`)
-
-    // Fallback: Use TradingView public scripts API to find script URL
-    console.log(`[TV Publish] Trying to find script URL via scripts API for title: "${title}"`)
-    try {
-      const serviceAccountUsername = process.env.TV_SERVICE_ACCOUNT_USERNAME || 'lirex14'
-      const scriptUrl = await page.evaluate(async ({ username, expectedTitle }) => {
-        try {
-          const encodedTitle = encodeURIComponent(expectedTitle)
-          const res = await fetch(`https://www.tradingview.com/api/v1/scripts/?page=1&per_page=10&by=${username}&q=${encodedTitle}`)
-          if (!res.ok) return null
-          const data = await res.json()
-          if (data?.results?.length > 0) {
-            // Find the script that matches our title (case-insensitive)
-            const matchingScript = data.results.find(
-              (s: { name: string }) => s.name.toLowerCase() === expectedTitle.toLowerCase()
-            )
-            if (matchingScript) {
-              return matchingScript.chart_url || matchingScript.url || (matchingScript.image_url ? `https://www.tradingview.com/script/${matchingScript.image_url}/` : null)
-            }
-            // Fallback to first result
-            const script = data.results[0]
-            return script.chart_url || script.url || (script.image_url ? `https://www.tradingview.com/script/${script.image_url}/` : null)
-          }
-          return null
-        } catch { return null }
-      }, { username: serviceAccountUsername, expectedTitle: title })
-
-      if (scriptUrl) {
-        console.log(`[TV Publish] Found script URL via fetch: ${scriptUrl}`)
-        return {
-          success: true,
-          indicatorUrl: scriptUrl,
-        }
-      }
-    } catch (e) {
-      console.log('[TV Publish] Fetch lookup failed:', e)
-    }
-
-    // If dialog closed, consider it a success even without URL
-    // The script was likely published
-    console.log('[TV Publish] Script appears to have been published but URL could not be retrieved')
+    console.log(`[TV Publish] Publish completed but script URL could not be captured within ${URL_CAPTURE_WINDOW_MS}ms`)
     return {
-      success: true,
-      indicatorUrl: undefined,
-      // Note: returning success=true because the dialog closed and publish button was clicked
+      success: false,
+      errorCode: 'URL_CAPTURE_FAILED_AFTER_PUBLISH',
+      publishedButUrlUnknown: true,
+      error: `Publish likely succeeded, but script URL could not be captured within ${Math.round(URL_CAPTURE_WINDOW_MS / 1000)} seconds. Check TradingView profile and retry.`,
     }
   } catch (error) {
     console.error('Script publishing failed:', error)
     return {
       success: false,
+      errorCode: 'PUBLISH_ACTION_FAILED',
       error: error instanceof Error ? error.message : 'Unknown error',
     }
   } finally {
@@ -1746,9 +1810,6 @@ export async function validateAndPublishWithWarmSession(
   const startTime = Date.now()
   console.log('[Warm Validate] Starting validation with warm session...')
 
-  // Track response handler at function level so we can clean up in catch block
-  let registeredResponseHandler: ((response: import('puppeteer-core').HTTPResponse) => void) | null = null
-
   try {
     // Reset editor state (clear previous content)
     console.log('[Warm Validate] Resetting editor state...')
@@ -1757,45 +1818,13 @@ export async function validateAndPublishWithWarmSession(
     await page.keyboard.press('Escape')
     await delay(100)
 
+    await ensureChartContext(page, 'Warm Validate')
+
     // Check if Monaco editor is accessible (might have navigated away after last publish)
     let editorExists = await page.$('.monaco-editor')
-
     if (!editorExists) {
-      console.log('[Warm Validate] Monaco editor not found, navigating back to chart...')
-      const currentUrl = page.url()
-      console.log(`[Warm Validate] Current URL: ${currentUrl}`)
-
-      // Navigate back to chart page
-      await page.goto('https://www.tradingview.com/chart/', {
-        waitUntil: 'networkidle2',
-        timeout: 30000,
-      })
-      await delay(2000)
-
-      // Reopen Pine Editor
-      const editorButtonSelectors = [
-        TV_SELECTORS.chart.pineEditorButton,
-        'button[title="Pine"]',
-        'button[aria-label="Pine"]',
-      ]
-
-      for (const selector of editorButtonSelectors) {
-        try {
-          const button = await page.$(selector)
-          if (button) {
-            await button.click()
-            console.log(`[Warm Validate] Clicked Pine Editor button: ${selector}`)
-            break
-          }
-        } catch {
-          // Try next
-        }
-      }
-
-      // Wait for editor to load
-      await page.waitForSelector('.monaco-editor', { timeout: 10000 })
-      await delay(500)
-      console.log('[Warm Validate] Pine Editor reopened')
+      console.log('[Warm Validate] Monaco editor not found, reopening from strict chart selectors...')
+      await ensureChartPineEditorOpen(page, 'Warm Validate')
       editorExists = await page.$('.monaco-editor')
     }
 
@@ -2014,80 +2043,9 @@ export async function validateAndPublishWithWarmSession(
       console.log('[Warm Validate] No blocking dialogs found')
     }
 
-    // Click publish button - use page.evaluate since page.$ is equally slow on this page
+    // Click publish button with strict selector allowlist.
     console.log('[Warm Validate] Looking for publish button...')
-
-    // First, try a simple direct query for the share button
-    const directClick = await page.evaluate(() => {
-      // Find all elements with title containing "Share"
-      const shareBtn = document.querySelector('[title*="Share your script" i]') as HTMLElement
-      if (shareBtn) {
-        const rect = shareBtn.getBoundingClientRect()
-        if (rect.width > 0) {
-          shareBtn.click()
-          return `direct:${shareBtn.getAttribute('title')}|w=${rect.width}`
-        }
-        return `found-but-no-width:${shareBtn.getAttribute('title')}|w=${rect.width}`
-      }
-      // Count elements with title attribute
-      const allTitles = document.querySelectorAll('[title]')
-      const shareMatches = Array.from(allTitles).filter(el =>
-        el.getAttribute('title')?.toLowerCase().includes('share')
-      )
-      return `not-found:total-titles=${allTitles.length},share-matches=${shareMatches.length}`
-    }).catch((e: Error) => `error:${e.message}`)
-
-    console.log(`[Warm Validate] Direct share button search: ${directClick}`)
-
-    let publishClicked = directClick?.startsWith('direct:') ? directClick : null
-
-    if (!publishClicked) {
-      publishClicked = await Promise.race([
-        page.evaluate(() => {
-          // Try data-name selectors (including publish-button from Pine Editor toolbar)
-          for (const sel of ['[data-name="publish-script-button"]', '[data-name="save-publish-button"]', '[data-name="publish-button"]']) {
-            const btn = document.querySelector(sel) as HTMLElement
-            if (btn && btn.getBoundingClientRect().width > 0) {
-              btn.click()
-              return `selector:${sel}`
-            }
-          }
-          // Try aria-label / title selectors (including "Share your script" which is the current TradingView button title)
-          for (const sel of ['[aria-label*="Publish" i]', '[title*="Publish" i]', '[title*="Share your script" i]', 'button[class*="publish" i]']) {
-            const btn = document.querySelector(sel) as HTMLElement
-            if (btn && btn.getBoundingClientRect().width > 0) {
-              btn.click()
-              return `attr:${sel}`
-            }
-          }
-          // Title attribute search - search ALL elements with title attribute
-          const allWithTitle = Array.from(document.querySelectorAll('[title]'))
-          const titleMatch = allWithTitle.find(el => {
-            const title = el.getAttribute('title')?.toLowerCase() || ''
-            return (title.includes('publish') || title.includes('share your script')) &&
-                   el.getBoundingClientRect().width > 0
-          })
-          if (titleMatch) {
-            (titleMatch as HTMLElement).click()
-            return `title-js:${titleMatch.getAttribute('title')}`
-          }
-          // Text-based search: find "Publish" in buttons/clickable elements
-          const allClickable = Array.from(document.querySelectorAll('button, [role="button"], div, span, a'))
-          const publishEl = allClickable.find(el => {
-            const text = el.textContent?.trim().toLowerCase() || ''
-            return text.includes('publish') &&
-                   el.getBoundingClientRect().width > 0 &&
-                   el.children.length <= 3
-          })
-          if (publishEl) {
-            (publishEl as HTMLElement).click()
-            return `text:${publishEl.textContent?.trim()}`
-          }
-          return null
-        }),
-        new Promise<null>((r) => setTimeout(() => r(null), 30000)),
-      ])
-    }
+    let publishClicked = await clickPublishButtonInChart(page, 'Warm Validate')
     if (publishClicked) {
       console.log(`[Warm Validate] Clicked publish button: ${publishClicked}`)
 
@@ -2115,23 +2073,7 @@ export async function validateAndPublishWithWarmSession(
           // Wait for chart to update, then re-click publish
           await delay(5000)
           console.log('[Warm Validate] Re-clicking publish button after adding to chart...')
-          publishClicked = await Promise.race([
-            page.evaluate(() => {
-              for (const sel of ['[data-name="publish-script-button"]', '[data-name="save-publish-button"]']) {
-                const btn = document.querySelector(sel) as HTMLElement
-                if (btn && btn.getBoundingClientRect().width > 0) { btn.click(); return `selector:${sel}` }
-              }
-              const allElements = Array.from(document.querySelectorAll('button, [role="button"], div, span'))
-              const publishEl = allElements.find(el => {
-                const text = el.textContent?.trim() || ''
-                return (text === 'Publish script' || text === 'Publish script…') &&
-                       el.getBoundingClientRect().width > 0 && el.children.length <= 2
-              })
-              if (publishEl) { (publishEl as HTMLElement).click(); return `text:${publishEl.textContent?.trim()}` }
-              return null
-            }),
-            new Promise<null>((r) => setTimeout(() => r(null), 10000)),
-          ])
+          publishClicked = await clickPublishButtonInChart(page, 'Warm Validate')
           if (publishClicked) {
             console.log(`[Warm Validate] Re-clicked publish: ${publishClicked}`)
             // Handle the "not on chart" dialog again if it reappears
@@ -2251,14 +2193,7 @@ export async function validateAndPublishWithWarmSession(
 
         // Re-click the publish button
         console.log('[Warm Validate] Re-clicking publish button after adding to chart...')
-        const rePublishClicked = await page.evaluate(() => {
-          const shareBtn = document.querySelector('[title*="Share your script" i]') as HTMLElement
-          if (shareBtn && shareBtn.getBoundingClientRect().width > 0) {
-            shareBtn.click()
-            return 'direct-retry'
-          }
-          return null
-        })
+        const rePublishClicked = await clickPublishButtonInChart(page, 'Warm Validate')
         if (rePublishClicked) {
           console.log(`[Warm Validate] Re-clicked publish: ${rePublishClicked}`)
           await delay(3000) // Wait for publish dialog to appear
@@ -2425,454 +2360,52 @@ export async function validateAndPublishWithWarmSession(
 
     await delay(300)
 
-    // Set up network request interception to capture script ID from API response
-    let capturedScriptId: string | null = null
-    let loggedUrls = new Set<string>()
-
-    const responseHandler = async (response: import('puppeteer-core').HTTPResponse) => {
-      try {
-        const url = response.url()
-        const status = response.status()
-
-        // Skip static assets entirely
-        if (url.includes('.js') || url.includes('.css') || url.includes('.png') || url.includes('.svg') ||
-            url.includes('.woff') || url.includes('.ico') || url.includes('.jpg') || url.includes('.gif')) return
-
-        // Log ALL tradingview.com network responses (including subdomains like pine-facade)
-        if (url.includes('tradingview.com') && !loggedUrls.has(url)) {
-          const urlPath = url.split('?')[0]
-          if (!urlPath.includes('/bundles/') && !urlPath.includes('/static/')) {
-            loggedUrls.add(url)
-            console.log(`[Warm Validate] Network [${status}]: ${urlPath.slice(-100)}`)
-          }
-        }
-
-        // Skip non-successful responses for body reading
-        if (status < 200 || status >= 300) return
-
-        // Read body for pine-facade responses or publish-related URLs
-        const isRelevantUrl = url.includes('pine-facade') ||
-                              url.includes('/pine_perm/') ||
-                              url.includes('/publish') ||
-                              url.includes('/script') ||
-                              url.includes('/save') ||
-                              url.includes('/create') ||
-                              url.includes('/api/')
-
-        if (isRelevantUrl) {
-          const text = await response.text().catch(() => '')
-
-          // Log the endpoint and response (abbreviated)
-          if (text.length > 0 && text.length < 10000) {
-            const urlPath = url.split('?')[0].slice(-80)
-            console.log(`[Warm Validate] API [${status}] ${urlPath}: ${text.slice(0, 500)}`)
-          }
-
-          // Look for script ID patterns in the response (various TradingView formats)
-          const idMatch = text.match(/"id"\s*:\s*"([a-zA-Z0-9]+)"/) ||
-                          text.match(/"scriptId"\s*:\s*"([a-zA-Z0-9]+)"/) ||
-                          text.match(/"script_id"\s*:\s*"([a-zA-Z0-9]+)"/) ||
-                          text.match(/"idScript"\s*:\s*"([a-zA-Z0-9]+)"/) ||
-                          text.match(/"scriptIdPart"\s*:\s*"([a-zA-Z0-9]+)"/) ||
-                          text.match(/\/script\/([a-zA-Z0-9]+)/) ||
-                          text.match(/"publishedUrl"\s*:\s*"[^"]*\/script\/([a-zA-Z0-9]+)/)
-
-          if (idMatch && !capturedScriptId) {
-            capturedScriptId = idMatch[1]
-            console.log(`[Warm Validate] Captured script ID from API: ${capturedScriptId}`)
-          }
-        }
-      } catch {
-        // Ignore errors
+    // Click final publish button (Step 2)
+    const submitted = await clickFinalPublishButton(page, visibility)
+    if (!submitted) {
+      return {
+        validation: validationResult,
+        publish: {
+          success: false,
+          errorCode: 'PUBLISH_ACTION_FAILED',
+          error: 'Could not find final publish button in step 2',
+        },
       }
     }
-    // Track handler at function level for cleanup in error paths
-    registeredResponseHandler = responseHandler
-    page.on('response', responseHandler)
 
-    // Get browser context to listen for new tabs
-    const browser = page.browser()
-    let newScriptPage: import('puppeteer-core').Page | null = null
-
-    // Set up listener for new page (TradingView opens new tab with published script)
-    const newPagePromise = new Promise<import('puppeteer-core').Page | null>((resolve) => {
-      const timeout = setTimeout(() => {
-        console.log('[Warm Validate] No new tab opened within timeout')
-        resolve(null)
-      }, 15000)
-
-      browser?.once('targetcreated', async (target) => {
-        clearTimeout(timeout)
-        try {
-          const newPage = await target.page()
-          if (newPage) {
-            console.log('[Warm Validate] New tab detected')
-            resolve(newPage)
-          } else {
-            resolve(null)
-          }
-        } catch (e) {
-          console.log('[Warm Validate] Error getting new tab:', e)
-          resolve(null)
-        }
-      })
+    const captured = await capturePublishedScriptUrl(page, {
+      logTag: 'Warm Validate',
+      title,
+      captureWindowMs: URL_CAPTURE_WINDOW_MS,
     })
 
-    // Click final publish button (Step 2)
-    await clickFinalPublishButton(page, visibility)
-
-    // Wait for new tab with published script URL OR dialog to close with success
-    console.log('[Warm Validate] Waiting for new tab with published script...')
-
-    // Start concurrent checks
-    const dialogClosedPromise = (async () => {
-      // Wait for publish dialog to close (up to 20s)
-      for (let i = 0; i < 20; i++) {
-        await delay(1000)
-        const dialogVisible = await page.evaluate(() => {
-          const dialog = document.querySelector('[data-dialog-name="publish-script"], [data-name="publish-dialog"], [class*="publish-dialog"]')
-          return dialog !== null && (dialog as HTMLElement).offsetParent !== null
-        }).catch(() => true)
-
-        if (!dialogVisible) {
-          console.log('[Warm Validate] Publish dialog closed after submit')
-          // Look for success notification or script link
-          const scriptUrl = await page.evaluate(() => {
-            // Check for toast notifications with success message
-            const toasts = document.querySelectorAll('[class*="toast"], [class*="notification"], [class*="snackbar"]')
-            for (const toast of toasts) {
-              const link = toast.querySelector('a[href*="/script/"]') as HTMLAnchorElement
-              if (link?.href) return link.href
-            }
-
-            // Check for any newly appeared script links
-            const scriptLinks = document.querySelectorAll('a[href*="/script/"]')
-            for (const link of scriptLinks) {
-              const href = (link as HTMLAnchorElement).href
-              if (href.includes('tradingview.com/script/')) {
-                return href
-              }
-            }
-            return null
-          }).catch(() => null)
-
-          if (scriptUrl) {
-            return { source: 'dialog-closed', url: scriptUrl }
-          }
-
-          // Dialog closed but no URL found yet - continue checking
-          return { source: 'dialog-closed', url: null }
-        }
-      }
-      return { source: 'timeout', url: null }
-    })()
-
-    newScriptPage = await newPagePromise
-
-    if (newScriptPage) {
-      try {
-        await newScriptPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {})
-        await delay(1000)
-        const newTabUrl = newScriptPage.url()
-        console.log(`[Warm Validate] New tab URL: ${newTabUrl}`)
-
-        if (newTabUrl.includes('/script/')) {
-          const totalTime = Date.now() - startTime
-          console.log(`[Warm Validate] Published successfully in ${totalTime}ms: ${newTabUrl}`)
-          // Close the new tab since we got the URL
-          await newScriptPage.close().catch(() => {})
-          return {
-            validation: validationResult,
-            publish: { success: true, indicatorUrl: newTabUrl },
-          }
-        }
-        // Close the new tab if it wasn't the script page
-        await newScriptPage.close().catch(() => {})
-      } catch (e) {
-        console.log('[Warm Validate] Error checking new tab:', e)
-        await newScriptPage.close().catch(() => {})
-      }
-    }
-
-    // Check if we captured script ID from network response
-    if (capturedScriptId) {
-      const indicatorUrl = `https://www.tradingview.com/script/${capturedScriptId}/`
+    if (captured.url) {
       const totalTime = Date.now() - startTime
-      console.log(`[Warm Validate] Published successfully via API capture in ${totalTime}ms: ${indicatorUrl}`)
-      page.off('response', responseHandler)
+      console.log(`[Warm Validate] Published successfully in ${totalTime}ms via ${captured.source}: ${captured.url}`)
       return {
         validation: validationResult,
-        publish: { success: true, indicatorUrl },
-      }
-    }
-
-    // Fallback: Try multiple times to find the URL in the current page
-    console.log('[Warm Validate] No URL from new tab or API, checking current page...')
-    for (let attempt = 0; attempt < 3; attempt++) {
-      await delay(2000)
-
-      // Check captured script ID again (might have been set during delay)
-      if (capturedScriptId) {
-        const indicatorUrl = `https://www.tradingview.com/script/${capturedScriptId}/`
-        const totalTime = Date.now() - startTime
-        console.log(`[Warm Validate] Published successfully via API capture in ${totalTime}ms: ${indicatorUrl}`)
-        page.off('response', responseHandler)
-        return {
-          validation: validationResult,
-          publish: { success: true, indicatorUrl },
-        }
-      }
-
-      // Check if we got redirected to the script page
-      const currentUrl = page.url()
-      console.log(`[Warm Validate] Attempt ${attempt + 1}: Current URL: ${currentUrl}`)
-
-      const indicatorMatch = currentUrl.match(/tradingview\.com\/script\/([^/]+)/)
-      if (indicatorMatch) {
-        const indicatorUrl = `https://www.tradingview.com/script/${indicatorMatch[1]}/`
-        const totalTime = Date.now() - startTime
-        console.log(`[Warm Validate] Published successfully in ${totalTime}ms: ${indicatorUrl}`)
-        return {
-          validation: validationResult,
-          publish: { success: true, indicatorUrl },
-        }
-      }
-
-      // Try to find script link in page - check toasts, dialogs, and body text
-      const indicatorUrl = await page.evaluate(() => {
-        // Check toast notifications first (TradingView shows success toasts)
-        const toasts = document.querySelectorAll('[class*="toast"], [class*="notification"], [class*="snackbar"], [data-name*="toast"]')
-        for (const toast of toasts) {
-          const link = toast.querySelector('a[href*="/script/"]') as HTMLAnchorElement
-          if (link?.href) return link.href
-          const text = toast.textContent || ''
-          const match = text.match(/tradingview\.com\/script\/([a-zA-Z0-9]+)/)
-          if (match) return `https://www.tradingview.com/script/${match[1]}/`
-        }
-
-        // Check any visible dialogs
-        const dialogs = document.querySelectorAll('[class*="dialog"], [role="dialog"], [data-dialog]')
-        for (const dialog of dialogs) {
-          const link = dialog.querySelector('a[href*="/script/"]') as HTMLAnchorElement
-          if (link?.href) return link.href
-        }
-
-        // Check all links on page
-        const links = Array.from(document.querySelectorAll('a[href*="/script/"]'))
-        for (const link of links) {
-          const href = (link as HTMLAnchorElement).href
-          if (href.includes('tradingview.com/script/')) {
-            return href
-          }
-        }
-
-        // Look for success message containing URL in body text
-        const successText = document.body.innerText
-        const urlMatch = successText.match(/tradingview\.com\/script\/([a-zA-Z0-9]+)/)
-        if (urlMatch) {
-          return `https://www.tradingview.com/script/${urlMatch[1]}/`
-        }
-
-        return null
-      })
-
-      if (indicatorUrl) {
-        const totalTime = Date.now() - startTime
-        console.log(`[Warm Validate] Published in ${totalTime}ms: ${indicatorUrl}`)
-        return {
-          validation: validationResult,
-          publish: { success: true, indicatorUrl },
-        }
-      }
-    }
-
-    // Check if dialog closed with a URL
-    const dialogResult = await dialogClosedPromise
-    if (dialogResult.url) {
-      const totalTime = Date.now() - startTime
-      console.log(`[Warm Validate] Found URL after dialog closed in ${totalTime}ms: ${dialogResult.url}`)
-      page.off('response', responseHandler)
-      return {
-        validation: validationResult,
-        publish: { success: true, indicatorUrl: dialogResult.url },
-      }
-    }
-    console.log(`[Warm Validate] Dialog check result: ${dialogResult.source}, url: ${dialogResult.url}`)
-
-    // If dialog closed successfully, try to get script URL via lightweight fetch
-    if (dialogResult.source === 'dialog-closed') {
-      console.log(`[Warm Validate] Dialog closed, trying lightweight script lookup for title: "${title}"`)
-
-      // Try to find the script by title via TradingView's public scripts API
-      const serviceAccountUsername = process.env.TV_SERVICE_ACCOUNT_USERNAME || 'lirex14'
-      const scriptUrl = await page.evaluate(async ({ username, expectedTitle }) => {
-        const debug: string[] = []
-        try {
-          // Use TradingView's public scripts API with title search
-          const encodedTitle = encodeURIComponent(expectedTitle)
-          const apiUrl = `https://www.tradingview.com/api/v1/scripts/?page=1&per_page=10&by=${username}&q=${encodedTitle}`
-          debug.push(`fetch:${apiUrl}`)
-          const response = await fetch(apiUrl)
-          debug.push(`status:${response.status}`)
-          if (response.ok) {
-            const data = await response.json()
-            debug.push(`count:${data?.count ?? 0}`)
-            if (data?.results?.length > 0) {
-              // Find the script that matches our title (case-insensitive)
-              const matchingScript = data.results.find(
-                (s: { name: string }) => s.name.toLowerCase() === expectedTitle.toLowerCase()
-              )
-              if (matchingScript) {
-                const chartUrl = matchingScript.chart_url || matchingScript.url
-                debug.push(`matched:${matchingScript.name}`)
-                debug.push(`chart_url:${chartUrl}`)
-                if (chartUrl) {
-                  return { url: chartUrl, source: 'scripts-api:title-match', debug }
-                }
-                if (matchingScript.image_url) {
-                  return { url: `https://www.tradingview.com/script/${matchingScript.image_url}/`, source: 'scripts-api:title-match:image_url', debug }
-                }
-              }
-              // Fallback to first result if no exact match (might be partial match)
-              const script = data.results[0]
-              const chartUrl = script.chart_url || script.url
-              debug.push(`fallback_name:${script.name}`)
-              debug.push(`chart_url:${chartUrl}`)
-              if (chartUrl) {
-                return { url: chartUrl, source: 'scripts-api:fallback', debug }
-              }
-              if (script.image_url) {
-                return { url: `https://www.tradingview.com/script/${script.image_url}/`, source: 'scripts-api:fallback:image_url', debug }
-              }
-            }
-            debug.push('no-results')
-          }
-
-          return { url: null, source: null, debug }
-        } catch (e) {
-          debug.push(`error:${e instanceof Error ? e.message : String(e)}`)
-          return { url: null, source: null, debug }
-        }
-      }, { username: serviceAccountUsername, expectedTitle: title })
-
-      console.log(`[Warm Validate] Script lookup debug: ${JSON.stringify(scriptUrl?.debug || [])}`)
-
-      if (scriptUrl?.url) {
-        const totalTime = Date.now() - startTime
-        console.log(`[Warm Validate] Found script URL via ${scriptUrl.source} in ${totalTime}ms: ${scriptUrl.url}`)
-        page.off('response', responseHandler)
-        return {
-          validation: validationResult,
-          publish: { success: true, indicatorUrl: scriptUrl.url },
-        }
-      }
-
-      console.log('[Warm Validate] Fetch lookup failed, retrying with delay...')
-
-      // Retry the fetch after a delay - publish may need time to propagate
-      await delay(3000)
-      const retryUrl = await page.evaluate(async ({ username, expectedTitle }) => {
-        try {
-          const encodedTitle = encodeURIComponent(expectedTitle)
-          const res = await fetch(`https://www.tradingview.com/api/v1/scripts/?page=1&per_page=10&by=${username}&q=${encodedTitle}`)
-          if (!res.ok) return null
-          const data = await res.json()
-          if (data?.results?.length > 0) {
-            // Find the script that matches our title (case-insensitive)
-            const matchingScript = data.results.find(
-              (s: { name: string }) => s.name.toLowerCase() === expectedTitle.toLowerCase()
-            )
-            if (matchingScript) {
-              const chartUrl = matchingScript.chart_url || matchingScript.url
-              if (chartUrl) return { url: chartUrl, source: 'retry:scripts-api:title-match' }
-              if (matchingScript.image_url) return { url: `https://www.tradingview.com/script/${matchingScript.image_url}/`, source: 'retry:scripts-api:title-match:image_url' }
-            }
-            // Fallback to first result
-            const script = data.results[0]
-            const chartUrl = script.chart_url || script.url
-            if (chartUrl) return { url: chartUrl, source: 'retry:scripts-api:fallback' }
-            if (script.image_url) return { url: `https://www.tradingview.com/script/${script.image_url}/`, source: 'retry:scripts-api:fallback:image_url' }
-          }
-          return null
-        } catch { return null }
-      }, { username: serviceAccountUsername, expectedTitle: title })
-
-      if (retryUrl) {
-        const totalTime = Date.now() - startTime
-        console.log(`[Warm Validate] Found script URL via retry ${retryUrl.source} in ${totalTime}ms: ${retryUrl.url}`)
-        page.off('response', responseHandler)
-        return {
-          validation: validationResult,
-          publish: { success: true, indicatorUrl: retryUrl.url },
-        }
-      }
-    }
-
-    // Final check for captured script ID
-    if (capturedScriptId) {
-      const indicatorUrl = `https://www.tradingview.com/script/${capturedScriptId}/`
-      const totalTime = Date.now() - startTime
-      console.log(`[Warm Validate] Published successfully via delayed API capture in ${totalTime}ms: ${indicatorUrl}`)
-      page.off('response', responseHandler)
-      return {
-        validation: validationResult,
-        publish: { success: true, indicatorUrl },
-      }
-    }
-
-    // Last resort: get most recent script without title filter, verify it was created very recently
-    console.log('[Warm Validate] Title search failed, trying most recent script with recency check...')
-    const recencyUsername = process.env.TV_SERVICE_ACCOUNT_USERNAME || 'lirex14'
-    const recentScriptUrl = await page.evaluate(async (username) => {
-      try {
-        const res = await fetch(`https://www.tradingview.com/api/v1/scripts/?page=1&per_page=1&by=${username}`)
-        if (!res.ok) return null
-        const data = await res.json()
-        if (data?.results?.length > 0) {
-          const script = data.results[0]
-          // Check if script was created within the last 5 minutes (300 seconds)
-          const createdAt = new Date(script.created_at).getTime()
-          const now = Date.now()
-          const ageSeconds = (now - createdAt) / 1000
-          if (ageSeconds < 300) {
-            const chartUrl = script.chart_url || script.url
-            return {
-              url: chartUrl || (script.image_url ? `https://www.tradingview.com/script/${script.image_url}/` : null),
-              name: script.name,
-              ageSeconds: Math.round(ageSeconds)
-            }
-          }
-        }
-        return null
-      } catch { return null }
-    }, recencyUsername)
-
-    if (recentScriptUrl?.url) {
-      const totalTime = Date.now() - startTime
-      console.log(`[Warm Validate] Found recent script "${recentScriptUrl.name}" (${recentScriptUrl.ageSeconds}s old) in ${totalTime}ms: ${recentScriptUrl.url}`)
-      page.off('response', responseHandler)
-      return {
-        validation: validationResult,
-        publish: { success: true, indicatorUrl: recentScriptUrl.url },
+        publish: {
+          success: true,
+          indicatorUrl: captured.url,
+          captureSource: captured.source,
+        },
       }
     }
 
     const totalTime = Date.now() - startTime
-    console.log(`[Warm Validate] Publish completed in ${totalTime}ms (URL not captured)`)
+    console.log(`[Warm Validate] Publish completed in ${totalTime}ms (URL not captured in ${URL_CAPTURE_WINDOW_MS}ms)`)
     await page.screenshot({ path: `${SCREENSHOT_DIR}/warm-publish-no-url.png` }).catch(() => {})
-    console.log('[Warm Validate] Script published but could not capture URL - check TradingView profile')
-    page.off('response', responseHandler)
-    // Return success with placeholder - the script IS published
     return {
       validation: validationResult,
-      publish: { success: true, indicatorUrl: 'https://www.tradingview.com/u/lirex14/#published-scripts' },
+      publish: {
+        success: false,
+        errorCode: 'URL_CAPTURE_FAILED_AFTER_PUBLISH',
+        publishedButUrlUnknown: true,
+        error: `Publish likely succeeded, but script URL could not be captured within ${Math.round(URL_CAPTURE_WINDOW_MS / 1000)} seconds. Check TradingView profile and retry.`,
+      },
     }
   } catch (error) {
     console.error('[Warm Validate] Error:', error)
-    // Clean up response handler to prevent memory leak
-    if (registeredResponseHandler) {
-      page.off('response', registeredResponseHandler)
-    }
     return {
       validation: {
         isValid: false,
@@ -2888,4 +2421,3 @@ export async function validateAndPublishWithWarmSession(
     }
   }
 }
-

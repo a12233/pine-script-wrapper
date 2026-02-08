@@ -10,11 +10,44 @@
 import puppeteer, { Browser, Page } from 'puppeteer-core'
 import fs from 'fs'
 import { injectCookies } from './browserless'
-import { parseTVCookies, TV_SELECTORS, SCREENSHOT_DIR, type TVCredentials } from './tradingview'
+import {
+  parseTVCookies,
+  TV_SELECTORS,
+  SCREENSHOT_DIR,
+  ensureChartContext,
+  ensureChartPineEditorOpen,
+  type TVCredentials,
+} from './tradingview'
 
 // Environment configuration
 const USE_WARM_LOCAL_BROWSER = process.env.USE_WARM_LOCAL_BROWSER === 'true'
 const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH
+
+// Helper for retrying operations with exponential backoff
+async function withRetry<T>(
+  operation: () => Promise<T>,
+  options: {
+    maxAttempts?: number
+    baseDelayMs?: number
+    operationName?: string
+  } = {}
+): Promise<T> {
+  const { maxAttempts = 3, baseDelayMs = 1000, operationName = 'operation' } = options
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await operation()
+    } catch (error) {
+      const isLastAttempt = attempt === maxAttempts
+      console.log(`[Retry] ${operationName} attempt ${attempt}/${maxAttempts} failed: ${error}`)
+      if (isLastAttempt) throw error
+      const delayMs = baseDelayMs * Math.pow(2, attempt - 1)
+      console.log(`[Retry] Waiting ${delayMs}ms before retry...`)
+      await delay(delayMs)
+    }
+  }
+  throw new Error('Unreachable')
+}
 
 // Warm session configuration (configurable via env)
 const IDLE_TIMEOUT = parseInt(process.env.WARM_SESSION_IDLE_TIMEOUT || '1800000') // 30 min default
@@ -42,11 +75,52 @@ let acquireQueue: Array<{
 // Lock to prevent race condition when creating session
 let sessionCreationPromise: Promise<WarmSession> | null = null
 
+// Pre-warm tracking
+let preWarmPromise: Promise<void> | null = null
+let preWarmCredentials: TVCredentials | null = null
+
 /**
  * Check if warm local browser is enabled
  */
 export function isWarmLocalBrowserEnabled(): boolean {
   return USE_WARM_LOCAL_BROWSER
+}
+
+/**
+ * Start pre-warming the browser session at app startup.
+ * This initializes Chrome and navigates to TradingView before any requests arrive.
+ * Call this early in server startup with service account credentials.
+ */
+export function startPreWarm(credentials: TVCredentials): void {
+  if (preWarmPromise) {
+    console.log('[Pre-warm] Already started, skipping')
+    return
+  }
+
+  preWarmCredentials = credentials
+
+  preWarmPromise = (async () => {
+    console.log('[Pre-warm] Starting Chrome initialization...')
+    const startTime = Date.now()
+
+    try {
+      const session = await acquireSession(credentials)
+      await releaseSession(true)
+      console.log(`[Pre-warm] Chrome ready for requests in ${Date.now() - startTime}ms`)
+    } catch (error) {
+      console.error('[Pre-warm] Failed to initialize:', error)
+      preWarmPromise = null // Allow retry
+    }
+  })()
+}
+
+/**
+ * Wait for pre-warm to complete (call before first validation request)
+ */
+export async function waitForPreWarm(): Promise<void> {
+  if (preWarmPromise) {
+    await preWarmPromise
+  }
 }
 
 /**
@@ -158,8 +232,8 @@ async function createWarmSession(credentials: TVCredentials): Promise<WarmSessio
   // Navigate to TradingView chart page
   console.log('[Warm Session] Navigating to TradingView...')
   await page.goto('https://www.tradingview.com/chart/', {
-    waitUntil: 'networkidle2',
-    timeout: 60000,
+    waitUntil: 'domcontentloaded',
+    timeout: 90000,
   })
 
   // Wait for page to stabilize and check if we're logged in
@@ -184,83 +258,10 @@ async function createWarmSession(credentials: TVCredentials): Promise<WarmSessio
     console.log('[Warm Session] Confirmed logged in to TradingView')
   }
 
-  // Open Pine Editor - same logic as browserless implementation
+  // Open Pine Editor on chart with strict selectors only.
   console.log('[Warm Session] Opening Pine Editor...')
-
-  // First check if Pine Editor is already open
-  const pineEditorVisible = await page.$(TV_SELECTORS.pineEditor.container)
-  if (pineEditorVisible) {
-    console.log('[Warm Session] Pine Editor already open')
-  } else {
-    // Try to click the Pine Editor button
-    const editorButtonSelectors = [
-      TV_SELECTORS.chart.pineEditorButton,  // '[data-name="open-pine-editor"]'
-      'button[title="Pine"]',
-      'button[aria-label="Pine"]',
-      'button[title*="Pine"]',
-      'button[aria-label*="Pine"]',
-    ]
-
-    let buttonFound = false
-    for (const selector of editorButtonSelectors) {
-      try {
-        const button = await page.$(selector)
-        if (button) {
-          await button.click()
-          buttonFound = true
-          console.log(`[Warm Session] Clicked Pine Editor button: ${selector}`)
-          break
-        }
-      } catch {
-        // Try next
-      }
-    }
-
-    if (!buttonFound) {
-      // Try finding by title/aria-label (same as browserless implementation)
-      const clicked = await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('button, div[role="button"], [role="button"]'))
-        const pineBtn = buttons.find(btn => {
-          const title = btn.getAttribute('title')
-          const ariaLabel = btn.getAttribute('aria-label')
-          return (title && title.toLowerCase().includes('pine')) ||
-                 (ariaLabel && ariaLabel.toLowerCase().includes('pine'))
-        })
-        if (pineBtn) {
-          (pineBtn as HTMLElement).click()
-          return true
-        }
-        return false
-      })
-
-      if (clicked) {
-        buttonFound = true
-        console.log('[Warm Session] Clicked Pine button via text search')
-      }
-    }
-  }
-
-  // Wait for Pine Editor container and Monaco editor - same selectors as browserless
-  console.log('[Warm Session] Waiting for Pine Editor to load...')
-  const pineEditorSelectors = [
-    TV_SELECTORS.pineEditor.container,  // '[data-name="pine-editor"]'
-    '.pine-editor-container',
-    '[data-role="panel-Pine"]',
-    '[id*="pine"]',
-    TV_SELECTORS.pineEditor.editorArea, // '.monaco-editor'
-  ]
-
-  let editorFound = false
-  for (const selector of pineEditorSelectors) {
-    try {
-      await page.waitForSelector(selector, { timeout: 10000 })
-      console.log(`[Warm Session] Found editor with selector: ${selector}`)
-      editorFound = true
-      break
-    } catch {
-      console.log(`[Warm Session] Selector ${selector} not found, trying next...`)
-    }
-  }
+  await ensureChartPineEditorOpen(page, 'Warm Session')
+  const editorFound = await page.$(TV_SELECTORS.pineEditor.editorArea)
 
   if (!editorFound) {
     // Take screenshot for debugging
@@ -517,32 +518,13 @@ export async function resetEditorState(page: Page): Promise<void> {
 
     // Navigate back to chart page
     await page.goto('https://www.tradingview.com/chart/', {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
+      waitUntil: 'domcontentloaded',
+      timeout: 90000,
     })
     await delay(2000)
 
-    // Reopen Pine Editor
-    const editorButtonSelectors = [
-      TV_SELECTORS.chart.pineEditorButton,
-      'button[title="Pine"]',
-      'button[aria-label="Pine"]',
-    ]
-
-    for (const selector of editorButtonSelectors) {
-      try {
-        const button = await page.$(selector)
-        if (button) {
-          await button.click()
-          console.log(`[Warm Session] Clicked Pine Editor button: ${selector}`)
-          break
-        }
-      } catch {
-        // Try next
-      }
-    }
-
-    // Wait for editor to load
+    await ensureChartContext(page, 'Warm Session')
+    await ensureChartPineEditorOpen(page, 'Warm Session')
     await page.waitForSelector('.monaco-editor', { timeout: 10000 })
     await delay(500)
     console.log('[Warm Session] Pine Editor reopened')
