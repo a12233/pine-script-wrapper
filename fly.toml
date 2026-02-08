@@ -8,6 +8,10 @@ primary_region = 'iad'
 
 [build]
 
+[env]
+  USE_WARM_BROWSER = 'true'
+  CHROME_CACHE_DIR = '/data/chrome-cache'
+
 [http_service]
   internal_port = 3000
   force_https = true

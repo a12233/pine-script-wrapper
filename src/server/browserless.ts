@@ -157,7 +157,8 @@ export async function createBrowserSession(options?: BrowserSessionOptions): Pro
   } else if (PUPPETEER_EXECUTABLE_PATH) {
     // Production mode: Launch headless Chromium in container
     // This is set in Dockerfile: PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-    console.log(`🌐 Launching headless Chromium: ${PUPPETEER_EXECUTABLE_PATH}`)
+    const cachedir = process.env.CHROME_CACHE_DIR
+    console.log(`🌐 Launching headless Chromium: ${PUPPETEER_EXECUTABLE_PATH}${cachedir ? ` (cache: ${cachedir})` : ''}`)
 
     const args = [
       '--no-sandbox',
@@ -175,6 +176,12 @@ export async function createBrowserSession(options?: BrowserSessionOptions): Pro
       '--disable-2d-canvas-clip-aa',
       '--disable-gl-drawing-for-tests',
     ]
+
+    // Use persistent disk cache on Fly volume if configured
+    if (cachedir) {
+      args.push(`--disk-cache-dir=${cachedir}`)
+      args.push(`--user-data-dir=${cachedir}/profile`)
+    }
 
     browser = await puppeteer.launch({
       headless: true,

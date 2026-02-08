@@ -52,6 +52,9 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
+# Create cache directories for persistent browser cache (Fly volume at /data)
+RUN mkdir -p /data/chrome-cache/profile /data/screenshots
+
 # Copy built application
 COPY --from=builder /app/.output ./.output
 COPY --from=builder /app/node_modules ./node_modules

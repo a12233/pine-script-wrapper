@@ -24,6 +24,21 @@ import {
 } from './prompts/pine-script-fix'
 import { publishPineScript } from './tradingview'
 import { startTimer } from './timing'
+import {
+  getWarmSession,
+  releaseWarmSession,
+  isWarmBrowserEnabled,
+  ensureWarmBrowser,
+} from './warm-browser'
+import {
+  createBrowserSession,
+  closeBrowserSession,
+  injectCookies,
+  navigateTo,
+  waitForElement,
+  type BrowserlessSession,
+} from './browserless'
+import { parseTVCookies } from './tradingview'
 
 // OpenRouter client
 const openrouter = createOpenAI({
@@ -73,28 +88,6 @@ export interface ValidationLoopResult {
 }
 
 /**
- * Fix Pine Script errors using OpenRouter LLM
- *
- * @param script - The original Pine Script with errors
- * @param errors - Formatted error messages from TradingView
- * @returns The fixed script (complete code)
- */
-async function fixPineScriptErrors(script: string, errors: string): Promise<string> {
-  console.log('[ValidationLoop] Attempting AI fix for Pine Script errors...')
-
-  const { text } = await generateText({
-    model: openrouter(DEFAULT_MODEL),
-    system: PINE_SCRIPT_FIX_SYSTEM_PROMPT,
-    prompt: buildFixPrompt(script, errors),
-  })
-
-  const fixedScript = extractPineScript(text)
-  console.log('[ValidationLoop] AI fix generated')
-
-  return fixedScript
-}
-
-/**
  * Run the validation loop with automatic error fixing
  *
  * @param script - The Pine Script to validate
@@ -114,7 +107,22 @@ export async function runValidationLoop(
   let fixSuccessful = false
   let lastResult: FullValidationResult | null = null
 
-  console.log('[ValidationLoop] Starting validation loop...')
+  // Try warm browser path if available
+  if (isWarmBrowserEnabled()) {
+    try {
+      await ensureWarmBrowser()
+      const warmResult = await runWarmValidationLoop(currentScript, maxRetries, publishOptions, timer)
+      if (warmResult) {
+        return warmResult
+      }
+      // If warm path returned null, fall through to cold path
+      console.log('[ValidationLoop] Warm path unavailable, falling back to cold path')
+    } catch (error) {
+      console.log('[ValidationLoop] Warm path failed, falling back to cold path:', error)
+    }
+  }
+
+  console.log('[ValidationLoop] Starting validation loop (cold path)...')
 
   // First validation attempt
   iterations++
@@ -283,4 +291,280 @@ async function publishAfterValidation(
 export async function quickValidate(script: string): Promise<FullValidationResult> {
   console.log('[ValidationLoop] Quick validation (no fix attempt)...')
   return validateWithServiceAccount(script)
+}
+
+// Helper function for delays
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Run validation+publish using the warm browser session.
+ * Returns null if warm browser isn't available (caller should fall back to cold path).
+ */
+async function runWarmValidationLoop(
+  script: string,
+  maxRetries: number,
+  publishOptions: PublishAfterValidationOptions | undefined,
+  timer: ReturnType<typeof startTimer>
+): Promise<ValidationLoopResult | null> {
+  const session = await getWarmSession()
+  if (!session) {
+    return null
+  }
+
+  const { page } = session
+
+  try {
+    console.log('[ValidationLoop] Using warm browser path')
+
+    // Ensure we're on /chart/ with Pine Editor open
+    const url = page.url()
+    if (!url.includes('tradingview.com/chart')) {
+      console.log('[ValidationLoop] Warm browser not on /chart/, navigating...')
+      const credentials = await getServiceAccountCredentials()
+      if (!credentials) {
+        return null // Fall back to cold path
+      }
+      const cookies = parseTVCookies(credentials)
+      await injectCookies(page, cookies)
+      await page.goto('https://www.tradingview.com/chart/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 90000,
+      })
+    }
+
+    // Ensure Pine Editor is open
+    const editorExists = await page.$('.monaco-editor')
+    if (!editorExists) {
+      console.log('[ValidationLoop] Pine Editor not open, opening...')
+      const selectors = ['[data-name="open-pine-editor"]', '[data-name="pine-dialog-button"]']
+      let opened = false
+      for (const sel of selectors) {
+        const btn = await page.$(sel)
+        if (btn) {
+          await btn.click()
+          try {
+            await page.waitForSelector('.monaco-editor', { timeout: 8000 })
+            console.log(`[ValidationLoop] Pine Editor opened via ${sel}`)
+            opened = true
+            break
+          } catch {
+            // Try next selector
+          }
+        }
+      }
+      if (!opened) {
+        console.log('[ValidationLoop] Could not open Pine Editor on warm session')
+        return null // Fall back to cold path
+      }
+    }
+
+    timer.mark('pine editor ready')
+
+    // === Validate: Insert script and click "Add to chart" ===
+    console.log('[Warm Validate] Inserting script...')
+    await page.click('.monaco-editor')
+    await page.keyboard.down('Control')
+    await page.keyboard.press('a')
+    await page.keyboard.up('Control')
+    await delay(50)
+    await page.evaluate((text: string) => navigator.clipboard.writeText(text), script)
+    await page.keyboard.down('Control')
+    await page.keyboard.press('v')
+    await page.keyboard.up('Control')
+    console.log('[Warm Validate] Script inserted')
+
+    await delay(1500) // Wait for auto-compile
+
+    // Click "Add to chart"
+    const addToChartSelectors = [
+      '[title*="Add to chart" i]',
+      '[data-name="add-script-to-chart"]',
+      '[aria-label*="Add to chart" i]',
+    ]
+
+    for (const sel of addToChartSelectors) {
+      const btn = await page.$(sel)
+      if (btn) {
+        await btn.click()
+        console.log(`[Warm Validate] Clicked "Add to chart": ${sel}`)
+        break
+      }
+    }
+
+    await delay(3000) // Wait for compilation result
+
+    // Extract errors from console
+    const errors = await page.evaluate(() => {
+      const consolePanelSelectors = ['[data-name="console-panel"]', '.console-panel', '[class*="console"]']
+      let consolePanel: Element | null = null
+      for (const sel of consolePanelSelectors) {
+        consolePanel = document.querySelector(sel)
+        if (consolePanel) break
+      }
+      if (!consolePanel) return []
+
+      const errorLines = consolePanel.querySelectorAll('.console-line.error, .error-line, .error')
+      const warningLines = consolePanel.querySelectorAll('.console-line.warning, .warning-line, .warning')
+
+      const parse = (el: Element, type: 'error' | 'warning') => {
+        const text = el.textContent || ''
+        const lineMatch = text.match(/line (\d+)/i)
+        return { line: lineMatch ? parseInt(lineMatch[1], 10) : 0, message: text.trim(), type }
+      }
+
+      return [
+        ...Array.from(errorLines).map(el => parse(el, 'error')),
+        ...Array.from(warningLines).map(el => parse(el, 'warning')),
+      ]
+    })
+
+    const rawOutput = await page.evaluate(() => {
+      const selectors = ['[data-name="console-panel"]', '.console-panel', '[class*="console"]']
+      for (const sel of selectors) {
+        const panel = document.querySelector(sel)
+        if (panel?.textContent) return panel.textContent
+      }
+      return ''
+    })
+
+    const errorCount = errors.filter(e => e.type === 'error').length
+    const isValid = errorCount === 0
+    console.log(`[Warm Validate] Validation: ${errorCount} errors, isValid=${isValid}`)
+
+    timer.mark('validation complete')
+
+    let currentScript = script
+    let iterations = 1
+    let fixAttempted = false
+    let fixSuccessful = false
+
+    // If invalid and retries available, try AI fix
+    if (!isValid && maxRetries > 0) {
+      fixAttempted = true
+      try {
+        const errorString = formatErrorsForLLM({
+          isValid: false,
+          errors,
+          rawOutput,
+          addedToChart: false,
+        })
+        const fixedScript = await fixPineScriptErrors(currentScript, errorString)
+
+        if (fixedScript && fixedScript.length >= 10) {
+          currentScript = fixedScript
+          iterations++
+
+          // Re-validate with fixed script
+          console.log('[Warm Validate] Re-validating fixed script...')
+          await page.click('.monaco-editor')
+          await page.keyboard.down('Control')
+          await page.keyboard.press('a')
+          await page.keyboard.up('Control')
+          await delay(50)
+          await page.evaluate((text: string) => navigator.clipboard.writeText(text), currentScript)
+          await page.keyboard.down('Control')
+          await page.keyboard.press('v')
+          await page.keyboard.up('Control')
+          await delay(1500)
+
+          // Click "Add to chart" again
+          for (const sel of addToChartSelectors) {
+            const btn = await page.$(sel)
+            if (btn) { await btn.click(); break }
+          }
+          await delay(3000)
+
+          const fixedErrors = await page.evaluate(() => {
+            const consolePanelSelectors = ['[data-name="console-panel"]', '.console-panel', '[class*="console"]']
+            let consolePanel: Element | null = null
+            for (const sel of consolePanelSelectors) {
+              consolePanel = document.querySelector(sel)
+              if (consolePanel) break
+            }
+            if (!consolePanel) return []
+            const errorLines = consolePanel.querySelectorAll('.console-line.error, .error-line, .error')
+            return Array.from(errorLines).map(el => {
+              const text = el.textContent || ''
+              const lineMatch = text.match(/line (\d+)/i)
+              return { line: lineMatch ? parseInt(lineMatch[1], 10) : 0, message: text.trim(), type: 'error' as const }
+            })
+          })
+
+          if (fixedErrors.length === 0) {
+            fixSuccessful = true
+            console.log('[Warm Validate] AI fix successful')
+          } else {
+            console.log(`[Warm Validate] AI fix failed, still ${fixedErrors.length} errors`)
+          }
+        }
+      } catch (error) {
+        console.error('[Warm Validate] AI fix error:', error)
+      }
+    }
+
+    const finalIsValid = fixAttempted ? fixSuccessful : isValid
+
+    // Publish if valid and publish options provided
+    let indicatorUrl: string | undefined
+    let publishError: string | undefined
+
+    if (finalIsValid && publishOptions) {
+      timer.mark('starting publish')
+      try {
+        const credentials = await getServiceAccountCredentials()
+        if (credentials) {
+          const publishResult = await publishPineScript(credentials, {
+            script: currentScript,
+            title: publishOptions.title,
+            description: publishOptions.description,
+            visibility: publishOptions.visibility,
+          })
+          if (publishResult.success) {
+            indicatorUrl = publishResult.indicatorUrl
+            console.log(`[Warm Validate] Published: ${indicatorUrl}`)
+          } else {
+            publishError = publishResult.error
+          }
+        }
+      } catch (error) {
+        publishError = error instanceof Error ? error.message : 'Unknown publish error'
+      }
+      timer.mark('publish complete')
+    }
+
+    timer.end()
+
+    return {
+      finalScript: currentScript,
+      isValid: finalIsValid,
+      iterations,
+      fixAttempted,
+      fixSuccessful,
+      finalErrors: finalIsValid ? [] : errors,
+      rawOutput,
+      addedToChart: finalIsValid,
+      indicatorUrl,
+      publishError,
+    }
+  } catch (error) {
+    console.error('[Warm Validate] Error:', error)
+    return null // Fall back to cold path
+  } finally {
+    releaseWarmSession()
+  }
+}
+
+/**
+ * Fix Pine Script errors using OpenRouter LLM (extracted for reuse)
+ */
+async function fixPineScriptErrors(script: string, errors: string): Promise<string> {
+  console.log('[ValidationLoop] Attempting AI fix for Pine Script errors...')
+  const { text } = await generateText({
+    model: openrouter(DEFAULT_MODEL),
+    system: PINE_SCRIPT_FIX_SYSTEM_PROMPT,
+    prompt: buildFixPrompt(script, errors),
+  })
+  const fixedScript = extractPineScript(text)
+  console.log('[ValidationLoop] AI fix generated')
+  return fixedScript
 }
