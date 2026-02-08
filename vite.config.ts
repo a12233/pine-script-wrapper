@@ -16,6 +16,7 @@ const config = defineConfig({
     devtools(),
     nitro({
       preset: 'node-server',
+      plugins: ['src/server/plugins/warm-browser-plugin.ts'],
       rollupConfig: {
         external: ['ws', 'bufferutil', 'utf-8-validate'],
       },

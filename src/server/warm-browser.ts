@@ -12,6 +12,7 @@
  */
 
 import puppeteer, { Browser, Page } from 'puppeteer-core'
+import fs from 'fs'
 import {
   injectCookies,
   type BrowserlessSession,
@@ -79,6 +80,12 @@ function getChromiumArgs(): string[] {
 
   // Use persistent cache dir if on Fly volume
   if (CHROME_CACHE_DIR) {
+    // Ensure cache directories exist
+    try {
+      fs.mkdirSync(`${CHROME_CACHE_DIR}/profile`, { recursive: true })
+    } catch {
+      // Directory may already exist or volume not mounted yet
+    }
     args.push(`--disk-cache-dir=${CHROME_CACHE_DIR}`)
     args.push(`--user-data-dir=${CHROME_CACHE_DIR}/profile`)
   }
@@ -404,7 +411,7 @@ let keepAliveTimer: ReturnType<typeof setInterval> | null = null
  * Start the keep-alive ping loop.
  * Pings the app's own health endpoint to prevent Fly.io machine suspension.
  */
-function startKeepAlive(): void {
+export function startKeepAlive(): void {
   if (!KEEP_ALIVE_ENABLED || !isWarmBrowserEnabled()) {
     return
   }
@@ -446,6 +453,4 @@ export function stopKeepAlive(): void {
   }
 }
 
-// Auto-start pre-warm and keep-alive when this module is first imported
-startPreWarm()
-startKeepAlive()
+// Startup is triggered by the Nitro plugin (src/server/plugins/warm-browser-plugin.ts)
