@@ -11,6 +11,16 @@ const CHROME_USER_DATA_DIR = process.env.CHROME_USER_DATA_DIR // Use existing Ch
 const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH // Set by Dockerfile for production
 const BROWSERLESS_STEALTH = process.env.BROWSERLESS_STEALTH !== 'false' // Default: enabled
 const BROWSERLESS_PROXY = process.env.BROWSERLESS_PROXY // 'residential' or 'datacenter'
+const BROWSERLESS_REPLAY = process.env.BROWSERLESS_REPLAY === 'true' // Session replay for debugging
+
+// Log browser configuration at startup
+console.log('[Browser Config]', {
+  USE_LOCAL_BROWSER,
+  PUPPETEER_EXECUTABLE_PATH: PUPPETEER_EXECUTABLE_PATH || '(not set)',
+  BROWSERLESS_API_KEY: BROWSERLESS_API_KEY ? '(set)' : '(not set)',
+  BROWSERLESS_STEALTH,
+  BROWSERLESS_PROXY: BROWSERLESS_PROXY || '(not set)',
+})
 
 /**
  * Auto-detect Chrome user data directory based on OS
@@ -92,6 +102,9 @@ function buildBrowserlessEndpoint(): string {
   if (BROWSERLESS_PROXY) {
     params.set('proxy', BROWSERLESS_PROXY)
   }
+  if (BROWSERLESS_REPLAY) {
+    params.set('record', 'true')
+  }
 
   return `${endpoint}?${params.toString()}`
 }
@@ -99,6 +112,12 @@ function buildBrowserlessEndpoint(): string {
 export interface BrowserlessSession {
   browser: Browser
   page: Page
+}
+
+export interface ReconnectableBrowserSession extends BrowserlessSession {
+  cdpSession?: CDPSession
+  reconnectEndpoint?: string
+  isBrowserless: boolean
 }
 
 export interface BrowserSessionOptions {
@@ -113,9 +132,18 @@ export interface BrowserSessionOptions {
  * - Falls back to Browserless.io if neither is available
  * @param options.forceVisible - Force visible browser for CAPTCHA solving
  */
-export async function createBrowserSession(options?: BrowserSessionOptions): Promise<BrowserlessSession> {
+export async function createBrowserSession(options?: BrowserSessionOptions): Promise<ReconnectableBrowserSession> {
   const forceVisible = options?.forceVisible ?? false
   let browser: Browser
+
+  console.log('[Browser] Creating session...', {
+    forceVisible,
+    USE_LOCAL_BROWSER,
+    PUPPETEER_EXECUTABLE_PATH: PUPPETEER_EXECUTABLE_PATH || '(not set)',
+    BROWSERLESS_API_KEY: BROWSERLESS_API_KEY ? '(set)' : '(not set)',
+  })
+
+  let isBrowserless = false
 
   if (USE_LOCAL_BROWSER || forceVisible) {
     // Launch local Chrome
@@ -132,6 +160,7 @@ export async function createBrowserSession(options?: BrowserSessionOptions): Pro
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       `--user-data-dir=${userDataDir}`,
+      '--remote-debugging-port=9222', // Allow Playwright to connect and observe
     ]
 
     // Launch minimized/hidden by default (unless headless or forceVisible)
@@ -191,6 +220,7 @@ export async function createBrowserSession(options?: BrowserSessionOptions): Pro
     browser = await puppeteer.connect({
       browserWSEndpoint: wsEndpoint,
     })
+    isBrowserless = true
   } else {
     throw new Error(
       'No browser available. Set one of: USE_LOCAL_BROWSER=true, PUPPETEER_EXECUTABLE_PATH, or BROWSERLESS_API_KEY'
@@ -213,7 +243,7 @@ export async function createBrowserSession(options?: BrowserSessionOptions): Pro
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
   )
 
-  return { browser, page }
+  return { browser, page, isBrowserless }
 }
 
 /**
@@ -221,6 +251,126 @@ export async function createBrowserSession(options?: BrowserSessionOptions): Pro
  */
 export async function closeBrowserSession(session: BrowserlessSession): Promise<void> {
   await session.browser.close()
+}
+
+// ============ Browserless Reconnect Support ============
+
+/**
+ * Enable reconnect on a Browserless session
+ * Free plan: 10s max reconnect timeout
+ * Must call this before any operation that might exceed session timeout
+ */
+export async function enableBrowserlessReconnect(
+  session: ReconnectableBrowserSession,
+  timeoutMs: number = 10000  // Free plan max
+): Promise<string | null> {
+  if (!session.isBrowserless) {
+    return null // Not applicable for local browser
+  }
+
+  try {
+    const cdpSession = await session.page.createCDPSession()
+    session.cdpSession = cdpSession
+
+    const result = await cdpSession.send('Browserless.reconnect' as any, {
+      timeout: timeoutMs,
+    }) as { browserWSEndpoint?: string; error?: string }
+
+    if (result.error) {
+      console.error('[Browserless] Reconnect setup failed:', result.error)
+      return null
+    }
+
+    session.reconnectEndpoint = result.browserWSEndpoint
+    console.log('[Browserless] Reconnect enabled, endpoint:', result.browserWSEndpoint)
+    return result.browserWSEndpoint || null
+  } catch (error) {
+    console.error('[Browserless] Failed to enable reconnect:', error)
+    return null
+  }
+}
+
+/**
+ * Reconnect to a Browserless session using saved endpoint
+ */
+export async function reconnectToBrowserless(
+  reconnectEndpoint: string
+): Promise<ReconnectableBrowserSession | null> {
+  try {
+    const params = new URLSearchParams()
+    params.set('token', BROWSERLESS_API_KEY!)
+
+    const wsEndpoint = `${reconnectEndpoint}?${params.toString()}`
+    console.log('[Browserless] Reconnecting to session...')
+
+    const browser = await puppeteer.connect({
+      browserWSEndpoint: wsEndpoint,
+    })
+
+    const pages = await browser.pages()
+    const page = pages[0] || await browser.newPage()
+
+    console.log('[Browserless] Reconnected successfully')
+    return {
+      browser,
+      page,
+      isBrowserless: true,
+      reconnectEndpoint,
+    }
+  } catch (error) {
+    console.error('[Browserless] Reconnect failed:', error)
+    return null
+  }
+}
+
+/**
+ * Execute a long operation with automatic reconnect handling for Browserless
+ * Splits operation into chunks, reconnecting between them if needed
+ */
+export async function withBrowserlessReconnect<T>(
+  session: ReconnectableBrowserSession,
+  operation: (session: ReconnectableBrowserSession) => Promise<T>,
+  options?: {
+    maxReconnects?: number
+    reconnectTimeoutMs?: number
+  }
+): Promise<T> {
+  const { maxReconnects = 3, reconnectTimeoutMs = 10000 } = options || {}
+
+  if (!session.isBrowserless) {
+    // Local browser - just run the operation
+    return operation(session)
+  }
+
+  // Enable reconnect before starting
+  await enableBrowserlessReconnect(session, reconnectTimeoutMs)
+
+  try {
+    return await operation(session)
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error)
+
+    // Check if this is a session timeout error
+    if (errorMsg.includes('Target closed') ||
+        errorMsg.includes('Session closed') ||
+        errorMsg.includes('Detached Frame')) {
+
+      if (session.reconnectEndpoint && maxReconnects > 0) {
+        console.log('[Browserless] Session timeout detected, attempting reconnect...')
+
+        const newSession = await reconnectToBrowserless(session.reconnectEndpoint)
+        if (newSession) {
+          // Retry with reconnected session
+          return withBrowserlessReconnect(newSession, operation, {
+            maxReconnects: maxReconnects - 1,
+            reconnectTimeoutMs,
+          })
+        }
+      }
+    }
+
+    throw error
+  }
 }
 
 /**
@@ -257,23 +407,38 @@ export async function waitForElement(
 }
 
 /**
- * Safe page navigation with error handling
+ * Safe page navigation with error handling and retry.
+ * Defaults to 'domcontentloaded' because TradingView's live data feeds
+ * (websockets, streaming quotes) prevent networkidle from ever resolving.
  */
 export async function navigateTo(
   page: Page,
   url: string,
-  options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2' }
+  options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2'; timeout?: number }
 ): Promise<boolean> {
+  const waitUntil = options?.waitUntil || 'domcontentloaded'
+  const timeout = options?.timeout || 90000
+
+  // First attempt
   try {
-    await page.goto(url, {
-      waitUntil: options?.waitUntil || 'networkidle2',
-      timeout: 60000,
-    })
+    await page.goto(url, { waitUntil, timeout })
     return true
   } catch (error) {
-    console.error(`Navigation to ${url} failed:`, error)
-    return false
+    console.error(`Navigation to ${url} failed (attempt 1, waitUntil=${waitUntil}):`, error)
   }
+
+  // Retry with 'load' as fallback if the first attempt wasn't already 'load'
+  if (waitUntil !== 'load') {
+    try {
+      console.log(`[navigateTo] Retrying ${url} with waitUntil=load...`)
+      await page.goto(url, { waitUntil: 'load', timeout })
+      return true
+    } catch (error) {
+      console.error(`Navigation to ${url} failed (attempt 2, waitUntil=load):`, error)
+    }
+  }
+
+  return false
 }
 
 // ============ Live Session Management (for Admin CAPTCHA solving) ============

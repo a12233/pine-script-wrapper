@@ -78,7 +78,8 @@ function ValidatePage() {
   })
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
-  const [visibility, setVisibility] = useState<'public' | 'private'>('public')
+  // Visibility is always public when using service account
+  const visibility = 'public' as const
   const [isCreatingCheckout, setIsCreatingCheckout] = useState(false)
   const [productDetails, setProductDetails] = useState<ProductDetails | null>(null)
 
@@ -106,10 +107,14 @@ function ValidatePage() {
     fetchProductDetails().then(setProductDetails).catch(console.error)
   }, [])
 
-  // Validate AND publish in one step (after user fills in title)
+  // Validate AND publish in one step (after user fills in title and description)
   const runValidationAndPublish = async () => {
     if (!title.trim()) {
       alert('Please enter a title for your indicator')
+      return
+    }
+    if (!description.trim()) {
+      alert('Please enter a description for your indicator (required by TradingView)')
       return
     }
 
@@ -248,7 +253,7 @@ function ValidatePage() {
           </div>
 
           <div className="form-group">
-            <label htmlFor="description">Description (optional)</label>
+            <label htmlFor="description">Description *</label>
             <textarea
               id="description"
               className="input"
@@ -256,35 +261,8 @@ function ValidatePage() {
               onChange={(e) => setDescription(e.target.value)}
               placeholder="Describe what your indicator does..."
               rows={3}
+              required
             />
-          </div>
-
-          <div className="form-group">
-            <label>Visibility</label>
-            <div className="visibility-options">
-              <label className="radio-label">
-                <input
-                  type="radio"
-                  name="visibility"
-                  value="public"
-                  checked={visibility === 'public'}
-                  onChange={() => setVisibility('public')}
-                />
-                <span>Public</span>
-                <small>Anyone can view and use your indicator</small>
-              </label>
-              <label className="radio-label">
-                <input
-                  type="radio"
-                  name="visibility"
-                  value="private"
-                  checked={visibility === 'private'}
-                  onChange={() => setVisibility('private')}
-                />
-                <span>Private</span>
-                <small>Only you can see and use this indicator</small>
-              </label>
-            </div>
           </div>
 
           <div className="price-info">
@@ -295,9 +273,9 @@ function ValidatePage() {
           <button
             className="btn btn-primary btn-large"
             onClick={runValidationAndPublish}
-            disabled={!title.trim()}
+            disabled={!title.trim() || !description.trim()}
           >
-            {title.trim() ? 'Validate & Publish' : 'Enter title to continue'}
+            {!title.trim() ? 'Enter title to continue' : !description.trim() ? 'Enter description to continue' : 'Validate & Publish'}
           </button>
         </div>
       )}

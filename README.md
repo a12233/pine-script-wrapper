@@ -147,6 +147,7 @@ pine-script-wrapper/
 ```bash
 npm run dev       # Start development server
 npm run dev:log   # Dev server with logging to /tmp/pine-dev.log
+npm run skill:pine-validate  # Fly logs + Playwright MCP validation/publish run
 npm run build     # Build for production
 npm run preview   # Preview production build
 npm run test      # Run tests
