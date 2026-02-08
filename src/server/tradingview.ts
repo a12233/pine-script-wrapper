@@ -232,9 +232,12 @@ export async function ensureChartContext(
 
 export async function ensureChartPineEditorOpen(
   page: import('puppeteer-core').Page,
-  requestTag: string = 'TV Nav'
+  requestTag: string = 'TV Nav',
+  options: { chartContextVerified?: boolean } = {}
 ): Promise<void> {
-  await ensureChartContext(page, requestTag)
+  if (!options.chartContextVerified) {
+    await ensureChartContext(page, requestTag)
+  }
 
   const alreadyOpen = await page.$(TV_SELECTORS.pineEditor.container)
   if (alreadyOpen) {
@@ -287,20 +290,55 @@ export async function ensureChartPineEditorOpen(
 
 export async function clickPublishButtonInChart(
   page: import('puppeteer-core').Page,
-  requestTag: string = 'TV Publish'
+  requestTag: string = 'TV Publish',
+  options: { chartContextVerified?: boolean; pineEditorVerified?: boolean } = {}
 ): Promise<string | null> {
-  await ensureChartContext(page, requestTag)
-  await ensureChartPineEditorOpen(page, requestTag)
+  if (!options.chartContextVerified) {
+    await ensureChartContext(page, requestTag)
+  }
+  if (!options.pineEditorVerified) {
+    await ensureChartPineEditorOpen(page, requestTag, { chartContextVerified: true })
+  }
 
+  const combinedSelector = STRICT_SELECTORS.publishButtons.join(', ')
+  const clickedFromCombined = await timedEvaluate<string | null>(
+    page,
+    (sel) => {
+      const candidates = Array.from(document.querySelectorAll(sel)) as HTMLElement[]
+      for (const btn of candidates) {
+        const rect = btn.getBoundingClientRect()
+        if (rect.width <= 0 || rect.height <= 0) continue
+        btn.click()
+        return btn.getAttribute('data-name') || btn.getAttribute('title') || sel
+      }
+      return null
+    },
+    combinedSelector,
+    3000,
+    null,
+  ).catch(() => null)
+
+  if (clickedFromCombined) {
+    await ensureChartContext(page, requestTag)
+    return clickedFromCombined
+  }
+
+  // Fallback: strict per-selector retry with short evaluate timeout.
   for (const selector of STRICT_SELECTORS.publishButtons) {
-    const clicked = await page.evaluate((sel) => {
-      const btn = document.querySelector(sel) as HTMLElement | null
-      if (!btn) return null
-      const rect = btn.getBoundingClientRect()
-      if (rect.width <= 0 || rect.height <= 0) return null
-      btn.click()
-      return sel
-    }, selector).catch(() => null)
+    const clicked = await timedEvaluate<string | null>(
+      page,
+      (sel) => {
+        const btn = document.querySelector(sel) as HTMLElement | null
+        if (!btn) return null
+        const rect = btn.getBoundingClientRect()
+        if (rect.width <= 0 || rect.height <= 0) return null
+        btn.click()
+        return sel
+      },
+      selector,
+      1500,
+      null,
+    ).catch(() => null)
 
     if (clicked) {
       await ensureChartContext(page, requestTag)
@@ -1448,8 +1486,7 @@ async function capturePublishedScriptUrl(
       try {
         const newPage = await target.page()
         if (!newPage) return
-        await newPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {})
-        await delay(500)
+        await newPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {})
         newTabUrl = canonicalizeTradingViewScriptUrl(newPage.url())
         if (newTabUrl) {
           console.log(`[${options.logTag}] Captured script URL from new tab: ${newTabUrl}`)
@@ -1482,24 +1519,30 @@ async function capturePublishedScriptUrl(
         return { url: redirectUrl, source: 'redirect' }
       }
 
-      const domUrlRaw = await page.evaluate(() => {
-        const toasts = document.querySelectorAll('[class*="toast"], [class*="notification"], [class*="snackbar"], [data-name*="toast"]')
-        for (const toast of toasts) {
-          const link = toast.querySelector('a[href*="/script/"]') as HTMLAnchorElement | null
-          if (link?.href) return link.href
-        }
+      const domUrlRaw = await timedEvaluate<string | null>(
+        page,
+        () => {
+          const toasts = document.querySelectorAll('[class*="toast"], [class*="notification"], [class*="snackbar"], [data-name*="toast"]')
+          for (const toast of toasts) {
+            const link = toast.querySelector('a[href*="/script/"]') as HTMLAnchorElement | null
+            if (link?.href) return link.href
+          }
 
-        const links = Array.from(document.querySelectorAll('a[href*="/script/"]'))
-        for (const link of links) {
-          const href = (link as HTMLAnchorElement).href
-          if (href.includes('tradingview.com/script/')) return href
-        }
+          const links = Array.from(document.querySelectorAll('a[href*="/script/"]'))
+          for (const link of links) {
+            const href = (link as HTMLAnchorElement).href
+            if (href.includes('tradingview.com/script/')) return href
+          }
 
-        const bodyText = document.body?.innerText || ''
-        const match = bodyText.match(/tradingview\.com\/script\/([a-zA-Z0-9]+)/)
-        if (match) return `https://www.tradingview.com/script/${match[1]}/`
-        return null
-      }).catch(() => null)
+          const bodyText = document.body?.innerText || ''
+          const match = bodyText.match(/tradingview\.com\/script\/([a-zA-Z0-9]+)/)
+          if (match) return `https://www.tradingview.com/script/${match[1]}/`
+          return null
+        },
+        undefined,
+        3000,
+        null,
+      ).catch(() => null)
       const domUrl = canonicalizeTradingViewScriptUrl(domUrlRaw)
       if (domUrl) {
         console.log(`[${options.logTag}] Captured URL from DOM: ${domUrl}`)
@@ -1519,18 +1562,30 @@ async function capturePublishedScriptUrl(
         console.log(
           `[${options.logTag}] Scripts API lookup attempt ${apiAttempt}/${API_LOOKUP_ELAPSED_SCHEDULE_MS.length} at ${elapsedMs}ms`
         )
-        const apiResults = await page.evaluate(async ({ username, expectedTitle }) => {
-          try {
-            const encodedTitle = encodeURIComponent(expectedTitle)
-            const res = await fetch(`https://www.tradingview.com/api/v1/scripts/?page=1&per_page=10&by=${username}&q=${encodedTitle}`)
-            if (!res.ok) return []
-            const data = await res.json()
-            if (!Array.isArray(data?.results)) return []
-            return data.results.slice(0, 10)
-          } catch {
-            return []
-          }
-        }, { username: serviceAccountUsername, expectedTitle: options.title })
+        const apiResults = await timedEvaluate(
+          page,
+          async ({ username, expectedTitle }) => {
+            try {
+              const encodedTitle = encodeURIComponent(expectedTitle)
+              const controller = new AbortController()
+              const timeout = setTimeout(() => controller.abort(), 5000)
+              const res = await fetch(
+                `https://www.tradingview.com/api/v1/scripts/?page=1&per_page=10&by=${username}&q=${encodedTitle}`,
+                { signal: controller.signal }
+              )
+              clearTimeout(timeout)
+              if (!res.ok) return []
+              const data = await res.json()
+              if (!Array.isArray(data?.results)) return []
+              return data.results.slice(0, 10)
+            } catch {
+              return []
+            }
+          },
+          { username: serviceAccountUsername, expectedTitle: options.title },
+          6000,
+          [] as ScriptApiResultItem[],
+        ).catch(() => [] as ScriptApiResultItem[])
 
         const canonicalApiUrl = selectExactTitleMatchScriptUrl(options.title, apiResults as ScriptApiResultItem[])
         if (canonicalApiUrl) {
@@ -1540,7 +1595,7 @@ async function capturePublishedScriptUrl(
         console.log(`[${options.logTag}] Scripts API attempt ${apiAttempt}: no exact title match (results=${apiResults.length})`)
       }
 
-      await delay(500)
+      await delay(250)
     }
 
     await newPagePromise.catch(() => {})
@@ -1834,33 +1889,39 @@ export async function validateAndPublishWithWarmSession(
 
     // Remove existing indicators from the chart (TradingView free tier limits to 2)
     console.log('[Warm Validate] Removing existing indicators from chart...')
-    const removedCount = await page.evaluate(() => {
-      let removed = 0
-      // Find all indicator legends/headers on the chart
-      const indicatorHeaders = document.querySelectorAll('[data-name="legend-source-item"], [class*="legend-"] [class*="title"], .chart-controls-bar [data-name]')
+    const removedCount = await timedEvaluate<number>(
+      page,
+      () => {
+        let removed = 0
+        // Find all indicator legends/headers on the chart
+        const indicatorHeaders = document.querySelectorAll('[data-name="legend-source-item"], [class*="legend-"] [class*="title"], .chart-controls-bar [data-name]')
 
-      for (const header of indicatorHeaders) {
-        // Look for close/remove button within or near the indicator
-        const closeBtn = header.querySelector('[data-name="legend-delete-action"], [class*="close"], [class*="remove"], [aria-label*="Remove"]') as HTMLElement
-        if (closeBtn) {
-          closeBtn.click()
-          removed++
+        for (const header of indicatorHeaders) {
+          // Look for close/remove button within or near the indicator
+          const closeBtn = header.querySelector('[data-name="legend-delete-action"], [class*="close"], [class*="remove"], [aria-label*="Remove"]') as HTMLElement
+          if (closeBtn) {
+            closeBtn.click()
+            removed++
+          }
         }
-      }
 
-      // Also try clicking any visible "Remove" buttons in indicator panels
-      const removeButtons = document.querySelectorAll('[data-name="legend-delete-action"], button[aria-label*="Remove" i]')
-      for (const btn of removeButtons) {
-        try {
-          (btn as HTMLElement).click()
-          removed++
-        } catch {
-          // Ignore
+        // Also try clicking any visible "Remove" buttons in indicator panels
+        const removeButtons = document.querySelectorAll('[data-name="legend-delete-action"], button[aria-label*="Remove" i]')
+        for (const btn of removeButtons) {
+          try {
+            (btn as HTMLElement).click()
+            removed++
+          } catch {
+            // Ignore
+          }
         }
-      }
 
-      return removed
-    })
+        return removed
+      },
+      undefined,
+      5000,
+      0,
+    ).catch(() => 0)
 
     if (removedCount > 0) {
       console.log(`[Warm Validate] Removed ${removedCount} existing indicators`)
@@ -1881,7 +1942,7 @@ export async function validateAndPublishWithWarmSession(
 
     // Insert script via clipboard paste
     console.log('[Warm Validate] Inserting script...')
-    await page.evaluate((text) => navigator.clipboard.writeText(text), script)
+    await timedEvaluate(page, (text) => navigator.clipboard.writeText(text), script, 3000, undefined)
     await page.keyboard.down('Control')
     await page.keyboard.press('v')
     await page.keyboard.up('Control')
@@ -1893,38 +1954,44 @@ export async function validateAndPublishWithWarmSession(
     // Click "Add to chart" to trigger validation
     const startUrl = page.url()
     console.log(`[Warm Validate] Clicking "Add to chart"... (current URL: ${startUrl})`)
-    const addToChartClicked = await page.evaluate(() => {
-      const selectors = [
-        '[data-name="add-script-to-chart"]',
-        '[aria-label*="Add to chart" i]',
-        '[title*="Add to chart" i]',
-      ]
+    const addToChartClicked = await timedEvaluate<{ clicked: boolean; selector: string | null }>(
+      page,
+      () => {
+        const selectors = [
+          '[data-name="add-script-to-chart"]',
+          '[aria-label*="Add to chart" i]',
+          '[title*="Add to chart" i]',
+        ]
 
-      for (const selector of selectors) {
-        try {
-          const btn = document.querySelector(selector) as HTMLElement
-          if (btn) {
-            btn.click()
-            return { clicked: true, selector }
+        for (const selector of selectors) {
+          try {
+            const btn = document.querySelector(selector) as HTMLElement
+            if (btn) {
+              btn.click()
+              return { clicked: true, selector }
+            }
+          } catch {
+            // Try next
           }
-        } catch {
-          // Try next
         }
-      }
 
-      // Fallback: search by text
-      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'))
-      const btn = buttons.find(b => {
-        const text = b.textContent?.toLowerCase() || ''
-        return text.includes('add to chart')
-      })
-      if (btn) {
-        (btn as HTMLElement).click()
-        return { clicked: true, selector: 'text search' }
-      }
+        // Fallback: search by text
+        const buttons = Array.from(document.querySelectorAll('button, [role="button"]'))
+        const btn = buttons.find(b => {
+          const text = b.textContent?.toLowerCase() || ''
+          return text.includes('add to chart')
+        })
+        if (btn) {
+          (btn as HTMLElement).click()
+          return { clicked: true, selector: 'text search' }
+        }
 
-      return { clicked: false, selector: null }
-    })
+        return { clicked: false, selector: null }
+      },
+      undefined,
+      5000,
+      { clicked: false, selector: null },
+    ).catch(() => ({ clicked: false, selector: null }))
 
     if (addToChartClicked.clicked) {
       console.log(`[Warm Validate] Clicked "Add to chart": ${addToChartClicked.selector}`)
@@ -2005,37 +2072,51 @@ export async function validateAndPublishWithWarmSession(
     const { title, description, visibility = 'public' } = publishOptions
 
     // Wait for page to settle after Add to chart (chart page JS is very heavy)
-    console.log('[Warm Validate] Waiting 8s for page to settle before publish...')
-    await delay(8000)
+    console.log('[Warm Validate] Waiting briefly for page settle before publish...')
+    await Promise.race([
+      page.waitForNetworkIdle({ idleTime: 500, timeout: 4000 }),
+      delay(1500),
+    ]).catch(() => {})
 
     // Dismiss any blocking dialogs by clicking their close buttons (NOT Escape, which closes Pine Editor)
     // IMPORTANT: Skip any dialog that contains .monaco-editor (that's the Pine Editor panel)
     console.log('[Warm Validate] Dismissing any blocking dialogs...')
-    const dismissedDialogs = await page.evaluate(() => {
-      const dismissed: string[] = []
-      const closeSelectors = [
-        '[data-name="close-dialog"]',
-        'button[aria-label="Close"]',
-        'button[aria-label="close"]',
-      ]
-      // Find dialog overlays - only target popup/modal dialogs, not panels
-      const dialogs = document.querySelectorAll('[class*="dialog"][class*="popup"], [class*="dialog"][class*="modal"], [class*="dialog"][class*="overlay"]')
-      for (const dialog of Array.from(dialogs)) {
-        const rect = (dialog as HTMLElement).getBoundingClientRect()
-        if (rect.width === 0) continue
-        // SKIP if this dialog contains the Monaco editor (Pine Editor panel)
-        if (dialog.querySelector('.monaco-editor')) continue
-        for (const sel of closeSelectors) {
-          const closeBtn = dialog.querySelector(sel) as HTMLElement
-          if (closeBtn && closeBtn.getBoundingClientRect().width > 0) {
-            closeBtn.click()
-            dismissed.push(`${sel} in ${dialog.className?.toString().slice(0, 50)}`)
-            break
-          }
-        }
-      }
-      return dismissed
-    })
+    const hasPotentialDialog = await page
+      .waitForSelector('[data-dialog-name], [role="dialog"]', { timeout: 1500 })
+      .then(() => true)
+      .catch(() => false)
+
+    const dismissedDialogs = hasPotentialDialog
+      ? await timedEvaluate<string[]>(
+          page,
+          () => {
+            const dismissed: string[] = []
+            const closeSelectors = [
+              '[data-name="close-dialog"]',
+              'button[aria-label="Close"]',
+              'button[aria-label="close"]',
+            ]
+            const dialogs = document.querySelectorAll('[data-dialog-name], [role="dialog"], [class*="dialog"][class*="popup"], [class*="dialog"][class*="modal"]')
+            for (const dialog of Array.from(dialogs)) {
+              const rect = (dialog as HTMLElement).getBoundingClientRect()
+              if (rect.width === 0 || rect.height === 0) continue
+              if (dialog.querySelector('.monaco-editor')) continue
+              for (const sel of closeSelectors) {
+                const closeBtn = dialog.querySelector(sel) as HTMLElement | null
+                if (closeBtn && closeBtn.getBoundingClientRect().width > 0) {
+                  closeBtn.click()
+                  dismissed.push(`${sel} in ${(dialog as HTMLElement).className?.toString().slice(0, 50)}`)
+                  break
+                }
+              }
+            }
+            return dismissed
+          },
+          undefined,
+          3000,
+          [],
+        ).catch(() => [])
+      : []
     if (dismissedDialogs.length > 0) {
       console.log(`[Warm Validate] Dismissed ${dismissedDialogs.length} dialogs:`, dismissedDialogs)
       await delay(1000)
@@ -2045,35 +2126,41 @@ export async function validateAndPublishWithWarmSession(
 
     // Click publish button with strict selector allowlist.
     console.log('[Warm Validate] Looking for publish button...')
-    let publishClicked = await clickPublishButtonInChart(page, 'Warm Validate')
+    let publishClicked = await clickPublishButtonInChart(page, 'Warm Validate', { chartContextVerified: true })
     if (publishClicked) {
       console.log(`[Warm Validate] Clicked publish button: ${publishClicked}`)
 
       // Handle "Script is not on the chart" dialog - click its "Add to chart" button
       await delay(1500)
-      const notOnChartHandled = await page.evaluate(() => {
+      const notOnChartHandled = await timedEvaluate<string | null>(
+        page,
+        () => {
         // Look for the "Script is not on the chart" dialog
-        const allText = Array.from(document.querySelectorAll('div, span, p'))
-        const notOnChart = allText.find(el => el.textContent?.includes('Script is not on the chart'))
-        if (notOnChart) {
-          // Find and click "Add to chart" button in the same dialog
-          const buttons = Array.from(document.querySelectorAll('button'))
-          const addBtn = buttons.find(b => b.textContent?.trim() === 'Add to chart')
-          if (addBtn) {
-            addBtn.click()
-            return 'clicked-add-to-chart'
+          const allText = Array.from(document.querySelectorAll('div, span, p'))
+          const notOnChart = allText.find(el => el.textContent?.includes('Script is not on the chart'))
+          if (notOnChart) {
+            // Find and click "Add to chart" button in the same dialog
+            const buttons = Array.from(document.querySelectorAll('button'))
+            const addBtn = buttons.find(b => b.textContent?.trim() === 'Add to chart')
+            if (addBtn) {
+              addBtn.click()
+              return 'clicked-add-to-chart'
+            }
+            return 'dialog-found-no-button'
           }
-          return 'dialog-found-no-button'
-        }
-        return null
-      })
+          return null
+        },
+        undefined,
+        3000,
+        null,
+      ).catch(() => null)
       if (notOnChartHandled) {
         console.log(`[Warm Validate] "Script not on chart" dialog: ${notOnChartHandled}`)
         if (notOnChartHandled === 'clicked-add-to-chart') {
           // Wait for chart to update, then re-click publish
           await delay(5000)
           console.log('[Warm Validate] Re-clicking publish button after adding to chart...')
-          publishClicked = await clickPublishButtonInChart(page, 'Warm Validate')
+          publishClicked = await clickPublishButtonInChart(page, 'Warm Validate', { chartContextVerified: true })
           if (publishClicked) {
             console.log(`[Warm Validate] Re-clicked publish: ${publishClicked}`)
             // Handle the "not on chart" dialog again if it reappears
@@ -2085,7 +2172,9 @@ export async function validateAndPublishWithWarmSession(
 
     if (!publishClicked) {
       // Debug: search for ANY element with "publish" anywhere
-      const debugInfo = await page.evaluate(() => {
+      const debugInfo = await timedEvaluate(
+        page,
+        () => {
         const monacoVisible = !!document.querySelector('.monaco-editor')
         // Search ALL elements for "publish" in text, attributes, class, data-name
         const allEls = Array.from(document.querySelectorAll('*'))
@@ -2126,8 +2215,12 @@ export async function validateAndPublishWithWarmSession(
                 title: el.getAttribute('title'),
               }))
           : []
-        return { monacoVisible, publishRelated: publishRelated.slice(0, 15), pineToolbarBtns: pineToolbarBtns.slice(0, 30) }
-      }).catch(() => ({ monacoVisible: false, publishRelated: [], pineToolbarBtns: [] }))
+          return { monacoVisible, publishRelated: publishRelated.slice(0, 15), pineToolbarBtns: pineToolbarBtns.slice(0, 30) }
+        },
+        undefined,
+        5000,
+        { monacoVisible: false, publishRelated: [], pineToolbarBtns: [] as any[] },
+      ).catch(() => ({ monacoVisible: false, publishRelated: [], pineToolbarBtns: [] }))
       console.log('[Warm Validate] Publish button not found. Debug:', JSON.stringify(debugInfo, null, 2))
       await page.screenshot({ path: `${SCREENSHOT_DIR}/warm-publish-no-button.png` }).catch(() => {})
       return {
@@ -2170,20 +2263,26 @@ export async function validateAndPublishWithWarmSession(
     }
 
     // Check again for "Script is not on the chart" dialog - it may have appeared during the wait
-    const notOnChartRetry = await page.evaluate(() => {
-      const allText = Array.from(document.querySelectorAll('div, span, p'))
-      const notOnChart = allText.find(el => el.textContent?.includes('Script is not on the chart'))
-      if (notOnChart) {
-        const buttons = Array.from(document.querySelectorAll('button'))
-        const addBtn = buttons.find(b => b.textContent?.trim() === 'Add to chart')
-        if (addBtn) {
-          addBtn.click()
-          return 'clicked-add-to-chart'
+    const notOnChartRetry = await timedEvaluate<string | null>(
+      page,
+      () => {
+        const allText = Array.from(document.querySelectorAll('div, span, p'))
+        const notOnChart = allText.find(el => el.textContent?.includes('Script is not on the chart'))
+        if (notOnChart) {
+          const buttons = Array.from(document.querySelectorAll('button'))
+          const addBtn = buttons.find(b => b.textContent?.trim() === 'Add to chart')
+          if (addBtn) {
+            addBtn.click()
+            return 'clicked-add-to-chart'
+          }
+          return 'dialog-found-no-button'
         }
-        return 'dialog-found-no-button'
-      }
-      return null
-    })
+        return null
+      },
+      undefined,
+      3000,
+      null,
+    ).catch(() => null)
     if (notOnChartRetry) {
       console.log(`[Warm Validate] "Script not on chart" dialog (retry): ${notOnChartRetry}`)
       if (notOnChartRetry === 'clicked-add-to-chart') {
@@ -2193,7 +2292,7 @@ export async function validateAndPublishWithWarmSession(
 
         // Re-click the publish button
         console.log('[Warm Validate] Re-clicking publish button after adding to chart...')
-        const rePublishClicked = await clickPublishButtonInChart(page, 'Warm Validate')
+        const rePublishClicked = await clickPublishButtonInChart(page, 'Warm Validate', { chartContextVerified: true })
         if (rePublishClicked) {
           console.log(`[Warm Validate] Re-clicked publish: ${rePublishClicked}`)
           await delay(3000) // Wait for publish dialog to appear
