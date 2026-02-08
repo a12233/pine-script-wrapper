@@ -369,7 +369,7 @@ export interface PublishResult {
   success: boolean
   indicatorUrl?: string
   error?: string
-  errorCode?: 'URL_CAPTURE_FAILED_AFTER_PUBLISH' | 'PUBLISH_ACTION_FAILED'
+  errorCode?: 'URL_CAPTURE_FAILED_AFTER_PUBLISH' | 'PUBLISH_ACTION_FAILED' | 'PUBLISH_DIALOG_NOT_FOUND' | 'DIALOG_FILL_FAILED'
   publishedButUrlUnknown?: boolean
   captureSource?: 'new-tab' | 'network-id' | 'redirect' | 'dom' | 'scripts-api'
 }
@@ -381,8 +381,8 @@ interface ScriptApiResultItem {
   image_url?: string
 }
 
-const URL_CAPTURE_WINDOW_MS = 60000
-const API_LOOKUP_ELAPSED_SCHEDULE_MS = [0, 2000, 5000, 9000, 14000, 20000, 27000, 35000, 45000, 55000] as const
+const URL_CAPTURE_WINDOW_MS = parseInt(process.env.TV_URL_CAPTURE_WINDOW_MS || '15000', 10)
+const API_LOOKUP_ELAPSED_SCHEDULE_MS = [0, 1000, 2500, 5000, 8000, 12000] as const
 
 export function resolveScriptsApiUsername(
   env: NodeJS.ProcessEnv = process.env
@@ -1287,7 +1287,7 @@ async function clickContinueButton(
     if (buttons.length > 0) {
       await buttons[0].click()
       console.log('[TV Publish Helper] Clicked Continue button')
-      await delay(1500)
+      await delay(400)
       return true
     }
   } catch (e) {
@@ -1345,7 +1345,8 @@ async function clickFinalPublishButton(
 
   // Use page.evaluate for reliable dialog-scoped search and exact text matching only.
   const clicked = await Promise.race([
-    page.evaluate((expected: string) => {
+    page.evaluate((args: { expected: string; privacy: 'public' | 'private' }) => {
+      const { expected, privacy } = args
       // Scope strictly to visible publish dialog containers first.
       const dialogs = Array.from(
         document.querySelectorAll('[data-dialog-name="publish-script"], [class*="dialog"], [role="dialog"]')
@@ -1376,10 +1377,10 @@ async function clickFinalPublishButton(
             return clickButton(btn, 'exact')
           }
         }
-        // Fallback: any button starting with "Publish" containing "script"
+        // Fallback: same privacy only, allowing text variants.
         for (const btn of buttons) {
           const text = btn.textContent?.trim().toLowerCase() || ''
-          if (text.startsWith('publish') && text.includes('script')) {
+          if (text.startsWith('publish') && text.includes(privacy.toLowerCase()) && text.includes('script')) {
             return clickButton(btn, 'partial')
           }
         }
@@ -1414,8 +1415,8 @@ async function clickFinalPublishButton(
         .map((el) => (el.textContent?.trim() || '(no-text)').slice(0, 50))
         .slice(0, 20)
       return `NOT_FOUND_NO_DIALOG:expected=${expected}:buttons=[${visibleBtns.join('|')}]`
-    }, expectedText),
-    new Promise<string>((r) => setTimeout(() => r('TIMEOUT'), 10000)),
+    }, { expected: expectedText, privacy }),
+    new Promise<string>((r) => setTimeout(() => r('TIMEOUT'), 5000)),
   ])
 
   if (clicked && !clicked.startsWith('NOT_FOUND') && clicked !== 'TIMEOUT') {
@@ -1948,8 +1949,11 @@ export async function validateAndPublishWithWarmSession(
     await page.keyboard.up('Control')
     console.log('[Warm Validate] Script inserted')
 
-    // Wait for compilation
-    await delay(2000)
+    // Wait briefly for compilation signals without forcing a long fixed sleep.
+    await Promise.race([
+      page.waitForNetworkIdle({ idleTime: 300, timeout: 900 }),
+      delay(600),
+    ]).catch(() => {})
 
     // Click "Add to chart" to trigger validation
     const startUrl = page.url()
@@ -2000,16 +2004,19 @@ export async function validateAndPublishWithWarmSession(
     // Log current URL to detect navigation
     console.log(`[Warm Validate] URL after Add to chart: ${page.url()}`)
 
-    // Wait for validation to complete, but also handle potential navigation
-    await delay(2500)
+    // Wait for validation to complete, but keep this bounded for latency.
+    await Promise.race([
+      page.waitForNetworkIdle({ idleTime: 400, timeout: 2000 }),
+      delay(1200),
+    ]).catch(() => {})
 
     console.log(`[Warm Validate] URL after delay: ${page.url()}`)
 
     // If page navigated (e.g. /pine/ "Add to chart" navigates to /chart/), wait for load
     if (page.url() !== startUrl) {
       console.log(`[Warm Validate] Page navigated! Waiting for load...`)
-      await page.waitForSelector('.monaco-editor', { timeout: 30000 }).catch(() => {})
-      await delay(3000)
+      await page.waitForSelector('.monaco-editor', { timeout: 12000 }).catch(() => {})
+      await delay(600)
     }
 
     // Extract errors from console panel (with timeout to prevent hanging)
@@ -2157,14 +2164,17 @@ export async function validateAndPublishWithWarmSession(
       if (notOnChartHandled) {
         console.log(`[Warm Validate] "Script not on chart" dialog: ${notOnChartHandled}`)
         if (notOnChartHandled === 'clicked-add-to-chart') {
-          // Wait for chart to update, then re-click publish
-          await delay(5000)
+          // Wait briefly for chart update, then re-click publish.
+          await Promise.race([
+            page.waitForNetworkIdle({ idleTime: 400, timeout: 2500 }),
+            delay(700),
+          ]).catch(() => {})
           console.log('[Warm Validate] Re-clicking publish button after adding to chart...')
           publishClicked = await clickPublishButtonInChart(page, 'Warm Validate', { chartContextVerified: true })
           if (publishClicked) {
             console.log(`[Warm Validate] Re-clicked publish: ${publishClicked}`)
-            // Handle the "not on chart" dialog again if it reappears
-            await delay(1500)
+            // Handle the "not on chart" dialog again if it reappears.
+            await delay(400)
           }
         }
       }
@@ -2229,9 +2239,13 @@ export async function validateAndPublishWithWarmSession(
       }
     }
 
-    // Wait for publish dialog - check if a dropdown menu appeared first
+    // Wait for publish dialog - check if a dropdown menu appeared first.
     console.log('[Warm Validate] Waiting for publish dialog or dropdown menu...')
-    await delay(1500)
+    await Promise.race([
+      page.waitForSelector('[data-dialog-name="publish-script"]', { timeout: 2500 }),
+      page.waitForSelector('[role="menuitem"]', { timeout: 2500 }),
+      delay(600),
+    ]).catch(() => {})
 
     // Check if a dropdown/menu appeared (TradingView sometimes has a menu before dialog)
     let hasDropdownMenu = false
@@ -2256,10 +2270,13 @@ export async function validateAndPublishWithWarmSession(
     } catch { /* no menu */ }
     if (hasDropdownMenu) {
       console.log('[Warm Validate] Clicked "Publish" in dropdown menu, waiting for dialog...')
-      await delay(2000)
+      await Promise.race([
+        page.waitForSelector('[data-dialog-name="publish-script"]', { timeout: 2500 }),
+        delay(700),
+      ]).catch(() => {})
     } else {
       console.log('[Warm Validate] No dropdown menu detected, dialog should be open')
-      await delay(500)
+      await delay(250)
     }
 
     // Check again for "Script is not on the chart" dialog - it may have appeared during the wait
@@ -2288,14 +2305,20 @@ export async function validateAndPublishWithWarmSession(
       if (notOnChartRetry === 'clicked-add-to-chart') {
         // Wait for script to be added to chart, then re-click publish
         console.log('[Warm Validate] Waiting for script to be added to chart...')
-        await delay(5000)
+        await Promise.race([
+          page.waitForNetworkIdle({ idleTime: 400, timeout: 2500 }),
+          delay(700),
+        ]).catch(() => {})
 
         // Re-click the publish button
         console.log('[Warm Validate] Re-clicking publish button after adding to chart...')
         const rePublishClicked = await clickPublishButtonInChart(page, 'Warm Validate', { chartContextVerified: true })
         if (rePublishClicked) {
           console.log(`[Warm Validate] Re-clicked publish: ${rePublishClicked}`)
-          await delay(3000) // Wait for publish dialog to appear
+          await Promise.race([
+            page.waitForSelector('[data-dialog-name="publish-script"]', { timeout: 2500 }),
+            delay(700),
+          ]).catch(() => {})
         } else {
           console.log('[Warm Validate] Failed to re-click publish button')
         }
@@ -2320,12 +2343,35 @@ export async function validateAndPublishWithWarmSession(
       }
     }
 
-    // Step 1a: Wait for dialog form to load (with shorter timeout)
-    console.log('[Warm Validate] Waiting for publish dialog form...')
+    // Step 1a: Wait for the publish dialog container to appear
+    console.log('[Warm Validate] Waiting for publish dialog container...')
+    const dialogContainer = await page.waitForSelector(
+      '[data-dialog-name="publish-script"]',
+      { visible: true, timeout: 8000 }
+    ).catch(() => null)
+
+    if (!dialogContainer) {
+      console.log('[Warm Validate] Publish dialog did not appear — bailing out')
+      await page.screenshot({ path: `${SCREENSHOT_DIR}/dialog-not-appeared.png` }).catch(() => {})
+      return {
+        validation: validationResult,
+        publish: {
+          success: false,
+          errorCode: 'PUBLISH_DIALOG_NOT_FOUND',
+          error: 'Publish dialog did not appear after clicking publish button',
+        },
+      }
+    }
+    console.log('[Warm Validate] Publish dialog container found')
+
+    // Step 1b: Wait for dialog form inputs to load within the dialog
+    console.log('[Warm Validate] Waiting for publish dialog form inputs...')
     const dialogReady = await evalWithTimeout(async () => {
-      for (let attempt = 0; attempt < 15; attempt++) {
+      for (let attempt = 0; attempt < 10; attempt++) {
         const ready = await page.evaluate(() => {
-          const inputs = Array.from(document.querySelectorAll('input'))
+          const dialog = document.querySelector('[data-dialog-name="publish-script"]')
+          if (!dialog) return false
+          const inputs = Array.from(dialog.querySelectorAll('input'))
             .filter(el => el.getBoundingClientRect().width > 100)
           return inputs.length > 0
         })
@@ -2333,10 +2379,10 @@ export async function validateAndPublishWithWarmSession(
           console.log(`[Warm Validate] Dialog form ready after ${attempt + 1} attempts`)
           return true
         }
-        await delay(500)
+        await delay(250)
       }
       return false
-    }, 10000, false)
+    }, 4000, false)
 
     if (!dialogReady) {
       console.log('[Warm Validate] Dialog form not ready - taking screenshot')
@@ -2346,10 +2392,12 @@ export async function validateAndPublishWithWarmSession(
       fillResult.push('dialog:READY')
     }
 
-    // Step 1b: Fill title (5 second timeout)
+    // Step 1c: Fill title (5 second timeout) — scoped to dialog
     console.log('[Warm Validate] Filling title...')
     const titleFilled = await evalWithTimeout(async () => {
       return await page.evaluate((titleText: string) => {
+        const dialog = document.querySelector('[data-dialog-name="publish-script"]')
+        if (!dialog) return null
         const selectors = [
           'input[placeholder="Title"]',
           'input[value="My script"]',
@@ -2357,7 +2405,7 @@ export async function validateAndPublishWithWarmSession(
           'input[class*="title"]',
         ]
         for (const sel of selectors) {
-          const input = document.querySelector(sel) as HTMLInputElement
+          const input = dialog.querySelector(sel) as HTMLInputElement
           if (input && input.getBoundingClientRect().width > 100) {
             const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
             if (setter) setter.call(input, titleText)
@@ -2367,8 +2415,8 @@ export async function validateAndPublishWithWarmSession(
             return sel
           }
         }
-        // Fallback: try any visible input
-        const inputs = Array.from(document.querySelectorAll('input'))
+        // Fallback: try any visible input within dialog
+        const inputs = Array.from(dialog.querySelectorAll('input'))
           .filter(el => el.getBoundingClientRect().width > 100) as HTMLInputElement[]
         if (inputs.length > 0) {
           const input = inputs[0]
@@ -2384,12 +2432,14 @@ export async function validateAndPublishWithWarmSession(
     }, 5000, null)
     fillResult.push(titleFilled ? `title:${titleFilled}` : 'title:FAILED')
 
-    // Step 1c: Fill description (5 second timeout)
+    // Step 1d: Fill description (5 second timeout) — scoped to dialog
     console.log('[Warm Validate] Filling description...')
     const descFilled = await evalWithTimeout(async () => {
       return await page.evaluate((descText: string) => {
+        const dialog = document.querySelector('[data-dialog-name="publish-script"]')
+        if (!dialog) return null
         // Try contenteditable first
-        const editables = Array.from(document.querySelectorAll('[contenteditable="true"]'))
+        const editables = Array.from(dialog.querySelectorAll('[contenteditable="true"]'))
           .filter(el => el.getBoundingClientRect().height > 20 && el.getBoundingClientRect().width > 100) as HTMLElement[]
         if (editables.length > 0) {
           const el = editables[0]
@@ -2399,7 +2449,7 @@ export async function validateAndPublishWithWarmSession(
           return 'contenteditable'
         }
         // Try textarea
-        const textareas = Array.from(document.querySelectorAll('textarea'))
+        const textareas = Array.from(dialog.querySelectorAll('textarea'))
           .filter(el => el.getBoundingClientRect().width > 100) as HTMLTextAreaElement[]
         if (textareas.length > 0) {
           const ta = textareas[0]
@@ -2414,13 +2464,13 @@ export async function validateAndPublishWithWarmSession(
     }, 5000, null)
     fillResult.push(descFilled ? `desc:${descFilled}` : 'desc:FAILED')
 
-    await delay(300)
-
-    // Step 1d: Click Continue button (5 second timeout)
+    // Step 1e: Click Continue button (5 second timeout) — scoped to dialog
     console.log('[Warm Validate] Looking for Continue button...')
     const continueClicked = await evalWithTimeout(async () => {
       return await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('button'))
+        const dialog = document.querySelector('[data-dialog-name="publish-script"]')
+        if (!dialog) return false
+        const buttons = Array.from(dialog.querySelectorAll('button'))
         const continueBtn = buttons.find(b => {
           const text = b.textContent?.toLowerCase() || ''
           return text.includes('continue') || text.includes('next')
@@ -2436,14 +2486,19 @@ export async function validateAndPublishWithWarmSession(
 
     // Wait for page transition after Continue
     if (continueClicked) {
-      await delay(1500)
+      await Promise.race([
+        page.waitForSelector('button, [role="button"]', { timeout: 1500 }),
+        delay(500),
+      ]).catch(() => {})
     }
 
-    // Step 1e: Click Public/Private (5 second timeout)
+    // Step 1f: Click Public/Private (5 second timeout) — scoped to dialog
     console.log(`[Warm Validate] Setting visibility to: ${visibility}...`)
     const privacySet = await evalWithTimeout(async () => {
       return await page.evaluate((privacy: string) => {
-        const elements = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"], label, [role="radio"]'))
+        const dialog = document.querySelector('[data-dialog-name="publish-script"]')
+        if (!dialog) return false
+        const elements = Array.from(dialog.querySelectorAll('button, [role="button"], [role="tab"], label, [role="radio"]'))
         const privacyBtn = elements.find(b => b.textContent?.toLowerCase().trim() === privacy)
         if (privacyBtn) {
           (privacyBtn as HTMLElement).click()
@@ -2454,10 +2509,135 @@ export async function validateAndPublishWithWarmSession(
     }, 5000, false)
     fillResult.push(privacySet ? `privacy:${visibility}` : 'privacy:FAILED')
 
-    await delay(300)
     console.log(`[Warm Validate] Dialog fill result: ${JSON.stringify(fillResult)}`)
 
-    await delay(300)
+    // Check if all fills failed — retry once with a longer delay
+    const allFailed = fillResult.every(r => r.includes('FAILED') || r.includes('NOT_READY'))
+    if (allFailed) {
+      console.log('[Warm Validate] All dialog fills failed — retrying after 3s delay...')
+      await delay(3000)
+
+      // Re-check dialog is still present
+      const retryDialog = await page.evaluate(() => {
+        const d = document.querySelector('[data-dialog-name="publish-script"]')
+        if (!d) return null
+        const inputs = Array.from(d.querySelectorAll('input'))
+          .filter(el => el.getBoundingClientRect().width > 100)
+        return { hasInputs: inputs.length > 0 }
+      })
+      if (!retryDialog?.hasInputs) {
+        console.log('[Warm Validate] Dialog not ready on retry — bailing out')
+        await page.screenshot({ path: `${SCREENSHOT_DIR}/dialog-retry-failed.png` }).catch(() => {})
+        return {
+          validation: validationResult,
+          publish: {
+            success: false,
+            errorCode: 'DIALOG_FILL_FAILED',
+            error: 'Publish dialog form could not be filled after retry',
+          },
+        }
+      }
+
+      // Retry title fill
+      const retryTitle = await evalWithTimeout(async () => {
+        return await page.evaluate((titleText: string) => {
+          const dialog = document.querySelector('[data-dialog-name="publish-script"]')
+          if (!dialog) return null
+          const inputs = Array.from(dialog.querySelectorAll('input'))
+            .filter(el => el.getBoundingClientRect().width > 100) as HTMLInputElement[]
+          if (inputs.length > 0) {
+            const input = inputs[0]
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+            if (setter) setter.call(input, titleText)
+            else input.value = titleText
+            input.dispatchEvent(new Event('input', { bubbles: true }))
+            input.dispatchEvent(new Event('change', { bubbles: true }))
+            return 'retry:input[0]'
+          }
+          return null
+        }, title)
+      }, 5000, null)
+
+      // Retry description fill
+      const retryDesc = await evalWithTimeout(async () => {
+        return await page.evaluate((descText: string) => {
+          const dialog = document.querySelector('[data-dialog-name="publish-script"]')
+          if (!dialog) return null
+          const editables = Array.from(dialog.querySelectorAll('[contenteditable="true"]'))
+            .filter(el => el.getBoundingClientRect().height > 20 && el.getBoundingClientRect().width > 100) as HTMLElement[]
+          if (editables.length > 0) {
+            const el = editables[0]
+            el.focus()
+            el.innerText = descText
+            el.dispatchEvent(new Event('input', { bubbles: true }))
+            return 'retry:contenteditable'
+          }
+          return null
+        }, descriptionText)
+      }, 5000, null)
+
+      // Retry continue button
+      const retryContinue = await evalWithTimeout(async () => {
+        return await page.evaluate(() => {
+          const dialog = document.querySelector('[data-dialog-name="publish-script"]')
+          if (!dialog) return false
+          const buttons = Array.from(dialog.querySelectorAll('button'))
+          const continueBtn = buttons.find(b => {
+            const text = b.textContent?.toLowerCase() || ''
+            return text.includes('continue') || text.includes('next')
+          })
+          if (continueBtn) {
+            continueBtn.click()
+            return true
+          }
+          return false
+        })
+      }, 5000, false)
+
+      if (retryContinue) {
+        await Promise.race([
+          page.waitForSelector('button, [role="button"]', { timeout: 1500 }),
+          delay(500),
+        ]).catch(() => {})
+      }
+
+      // Retry privacy
+      const retryPrivacy = await evalWithTimeout(async () => {
+        return await page.evaluate((privacy: string) => {
+          const dialog = document.querySelector('[data-dialog-name="publish-script"]')
+          if (!dialog) return false
+          const elements = Array.from(dialog.querySelectorAll('button, [role="button"], [role="tab"], label, [role="radio"]'))
+          const privacyBtn = elements.find(b => b.textContent?.toLowerCase().trim() === privacy)
+          if (privacyBtn) {
+            (privacyBtn as HTMLElement).click()
+            return true
+          }
+          return false
+        }, visibility)
+      }, 5000, false)
+
+      const retryResult = [
+        retryTitle ? `title:${retryTitle}` : 'title:FAILED',
+        retryDesc ? `desc:${retryDesc}` : 'desc:FAILED',
+        retryContinue ? 'continue:OK' : 'continue:FAILED',
+        retryPrivacy ? `privacy:${visibility}` : 'privacy:FAILED',
+      ]
+      console.log(`[Warm Validate] Retry fill result: ${JSON.stringify(retryResult)}`)
+
+      const retryAllFailed = retryResult.every(r => r.includes('FAILED'))
+      if (retryAllFailed) {
+        console.log('[Warm Validate] Retry also failed — bailing out')
+        await page.screenshot({ path: `${SCREENSHOT_DIR}/dialog-fill-retry-failed.png` }).catch(() => {})
+        return {
+          validation: validationResult,
+          publish: {
+            success: false,
+            errorCode: 'DIALOG_FILL_FAILED',
+            error: `Publish dialog form fill failed after retry: ${JSON.stringify(retryResult)}`,
+          },
+        }
+      }
+    }
 
     // Click final publish button (Step 2)
     const submitted = await clickFinalPublishButton(page, visibility)
