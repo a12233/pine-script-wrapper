@@ -390,5 +390,62 @@ export function startPreWarm(): void {
   })
 }
 
-// Auto-start pre-warm when this module is first imported
+// ============ Keep-Alive Ping ============
+// Prevents Fly.io from auto-suspending the machine after idle timeout (~5min).
+// Only active when the warm browser is enabled, since there's no point keeping
+// the machine alive without a warm browser to preserve.
+
+const KEEP_ALIVE_ENABLED = process.env.KEEP_ALIVE_ENABLED !== 'false' // Enabled by default when warm browser is on
+const KEEP_ALIVE_INTERVAL_MS = parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || '240000', 10) // 4 minutes default
+
+let keepAliveTimer: ReturnType<typeof setInterval> | null = null
+
+/**
+ * Start the keep-alive ping loop.
+ * Pings the app's own health endpoint to prevent Fly.io machine suspension.
+ */
+function startKeepAlive(): void {
+  if (!KEEP_ALIVE_ENABLED || !isWarmBrowserEnabled()) {
+    return
+  }
+
+  if (keepAliveTimer) {
+    return // Already running
+  }
+
+  console.log(`[KeepAlive] Starting self-ping every ${KEEP_ALIVE_INTERVAL_MS / 1000}s`)
+
+  keepAliveTimer = setInterval(async () => {
+    try {
+      const res = await fetch('http://localhost:3000/', {
+        method: 'HEAD',
+        signal: AbortSignal.timeout(5000),
+      })
+      console.log(`[KeepAlive] Ping: ${res.status}`)
+    } catch (error) {
+      // Don't log full error to avoid noise — a failed ping just means the
+      // machine might suspend, which is recoverable
+      console.log('[KeepAlive] Ping failed (non-fatal)')
+    }
+  }, KEEP_ALIVE_INTERVAL_MS)
+
+  // Don't block process exit
+  if (keepAliveTimer.unref) {
+    keepAliveTimer.unref()
+  }
+}
+
+/**
+ * Stop the keep-alive ping loop.
+ */
+export function stopKeepAlive(): void {
+  if (keepAliveTimer) {
+    clearInterval(keepAliveTimer)
+    keepAliveTimer = null
+    console.log('[KeepAlive] Stopped')
+  }
+}
+
+// Auto-start pre-warm and keep-alive when this module is first imported
 startPreWarm()
+startKeepAlive()

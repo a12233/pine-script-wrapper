@@ -11,6 +11,7 @@ primary_region = 'iad'
 [env]
   USE_WARM_BROWSER = 'true'
   CHROME_CACHE_DIR = '/data/chrome-cache'
+  KEEP_ALIVE_ENABLED = 'true'
 
 [http_service]
   internal_port = 3000
