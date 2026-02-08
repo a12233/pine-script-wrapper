@@ -170,14 +170,21 @@ async function runValidationLoopInternal(
   // Check if warm local browser is enabled for fast validation
   if (isWarmLocalBrowserEnabled()) {
     console.log(`[ValidationLoop:${requestId}] Using warm local browser (USE_WARM_LOCAL_BROWSER=true)`)
-    const warmResult = await runValidationLoopWithWarmSession(
-      script,
-      maxRetries,
-      publishOptions,
-      timer,
-      requestId
-    )
-    return warmResult
+    try {
+      const warmResult = await runValidationLoopWithWarmSession(
+        script,
+        maxRetries,
+        publishOptions,
+        timer,
+        requestId
+      )
+      return warmResult
+    } catch (error) {
+      console.error(
+        `[ValidationLoop:${requestId}] Warm local browser path failed, falling back to regular path:`,
+        error
+      )
+    }
   }
 
   // If publish options provided, use shared code path (single browser session for validate + publish)

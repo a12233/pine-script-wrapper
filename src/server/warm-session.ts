@@ -4,7 +4,8 @@
  * Manages a persistent browser session with TradingView pre-loaded for fast validation.
  * Session stays warm between requests to avoid cold start latency (~70s -> ~8s).
  *
- * Feature flag: USE_WARM_LOCAL_BROWSER=true enables this path
+ * Feature flag: USE_WARM_LOCAL_BROWSER=true enables this path.
+ * Production default is enabled unless explicitly set to false.
  */
 
 import puppeteer, { Browser, Page } from 'puppeteer-core'
@@ -20,7 +21,6 @@ import {
 } from './tradingview'
 
 // Environment configuration
-const USE_WARM_LOCAL_BROWSER = process.env.USE_WARM_LOCAL_BROWSER === 'true'
 const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH
 
 // Helper for retrying operations with exponential backoff
@@ -83,7 +83,10 @@ let preWarmCredentials: TVCredentials | null = null
  * Check if warm local browser is enabled
  */
 export function isWarmLocalBrowserEnabled(): boolean {
-  return USE_WARM_LOCAL_BROWSER
+  const raw = process.env.USE_WARM_LOCAL_BROWSER
+  if (raw === 'true') return true
+  if (raw === 'false') return false
+  return process.env.NODE_ENV === 'production'
 }
 
 /**
