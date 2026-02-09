@@ -9,6 +9,9 @@
  * 2. Navigates to TradingView /chart/ and opens Pine Editor
  * 3. Reuses the same browser/page for all validation requests
  * 4. Handles recovery if the page crashes or becomes unresponsive
+ *
+ * IMPORTANT: All mutable state lives on globalThis to survive Nitro's
+ * code-splitting (plugin chunk vs validation-loop chunk).
  */
 
 import puppeteer, { Browser, Page } from 'puppeteer-core'
@@ -37,14 +40,30 @@ interface WarmBrowser {
   requestCount: number
 }
 
-let warmBrowser: WarmBrowser | null = null
-let initPromise: Promise<void> | null = null
+// Use globalThis to share state across module boundaries.
+// Nitro bundles the plugin and validation-loop into separate chunks,
+// each with their own module-level variables. globalThis is the only
+// way to share singleton state between them.
+interface WarmBrowserGlobal {
+  warmBrowser: WarmBrowser | null
+  initPromise: Promise<void> | null
+  waitQueue: Array<{
+    resolve: (session: BrowserlessSession) => void
+    reject: (error: Error) => void
+  }>
+  keepAliveTimer: ReturnType<typeof setInterval> | null
+}
 
-// Queue for requests waiting for the warm browser
-const waitQueue: Array<{
-  resolve: (session: BrowserlessSession) => void
-  reject: (error: Error) => void
-}> = []
+const g = globalThis as unknown as { __warmBrowser?: WarmBrowserGlobal }
+if (!g.__warmBrowser) {
+  g.__warmBrowser = {
+    warmBrowser: null,
+    initPromise: null,
+    waitQueue: [],
+    keepAliveTimer: null,
+  }
+}
+const shared = g.__warmBrowser
 
 /** Max requests before recycling the browser (prevent memory leaks) */
 const MAX_REQUESTS = 200
@@ -224,7 +243,7 @@ async function initWarmBrowser(): Promise<void> {
     const browser = await launchBrowser()
     const page = await setupPage(browser)
 
-    warmBrowser = {
+    shared.warmBrowser = {
       browser,
       page,
       state: 'initializing',
@@ -240,23 +259,23 @@ async function initWarmBrowser(): Promise<void> {
       console.warn('[WarmBrowser] No service account credentials - browser launched but not authenticated')
     }
 
-    warmBrowser.state = 'idle'
+    shared.warmBrowser.state = 'idle'
     console.log(`[WarmBrowser] Ready in ${Date.now() - start}ms`)
 
     // Drain the wait queue
-    while (waitQueue.length > 0) {
-      const waiter = waitQueue.shift()!
-      waiter.resolve({ browser: warmBrowser.browser, page: warmBrowser.page })
+    while (shared.waitQueue.length > 0) {
+      const waiter = shared.waitQueue.shift()!
+      waiter.resolve({ browser: shared.warmBrowser.browser, page: shared.warmBrowser.page })
     }
   } catch (error) {
     console.error('[WarmBrowser] Initialization failed:', error)
-    if (warmBrowser) {
-      warmBrowser.state = 'error'
+    if (shared.warmBrowser) {
+      shared.warmBrowser.state = 'error'
     }
 
     // Reject all waiters
-    while (waitQueue.length > 0) {
-      const waiter = waitQueue.shift()!
+    while (shared.waitQueue.length > 0) {
+      const waiter = shared.waitQueue.shift()!
       waiter.reject(new Error(`Warm browser init failed: ${error}`))
     }
 
@@ -268,9 +287,9 @@ async function initWarmBrowser(): Promise<void> {
  * Check if the warm browser needs recycling
  */
 function needsRecycle(): boolean {
-  if (!warmBrowser) return false
-  if (warmBrowser.requestCount >= MAX_REQUESTS) return true
-  if (Date.now() - warmBrowser.createdAt > MAX_AGE_MS) return true
+  if (!shared.warmBrowser) return false
+  if (shared.warmBrowser.requestCount >= MAX_REQUESTS) return true
+  if (Date.now() - shared.warmBrowser.createdAt > MAX_AGE_MS) return true
   return false
 }
 
@@ -279,15 +298,15 @@ function needsRecycle(): boolean {
  */
 async function recycleBrowser(): Promise<void> {
   console.log('[WarmBrowser] Recycling browser...')
-  if (warmBrowser) {
+  if (shared.warmBrowser) {
     try {
-      await warmBrowser.browser.close()
+      await shared.warmBrowser.browser.close()
     } catch {
       // Ignore close errors
     }
-    warmBrowser = null
+    shared.warmBrowser = null
   }
-  initPromise = null
+  shared.initPromise = null
   await ensureWarmBrowser()
 }
 
@@ -299,16 +318,16 @@ export async function ensureWarmBrowser(): Promise<void> {
     return // Not configured for warm browser
   }
 
-  if (warmBrowser && warmBrowser.state !== 'error' && warmBrowser.state !== 'initializing') {
+  if (shared.warmBrowser && shared.warmBrowser.state !== 'error' && shared.warmBrowser.state !== 'initializing') {
     return // Already initialized and ready
   }
 
-  if (initPromise) {
-    return initPromise // Wait for ongoing initialization
+  if (shared.initPromise) {
+    return shared.initPromise // Wait for ongoing initialization
   }
 
-  initPromise = initWarmBrowser()
-  return initPromise
+  shared.initPromise = initWarmBrowser()
+  return shared.initPromise
 }
 
 /**
@@ -317,29 +336,29 @@ export async function ensureWarmBrowser(): Promise<void> {
  * Falls back to creating a fresh session if warm browser isn't available.
  */
 export async function getWarmSession(): Promise<BrowserlessSession | null> {
-  if (!warmBrowser || warmBrowser.state === 'error') {
+  if (!shared.warmBrowser || shared.warmBrowser.state === 'error') {
     return null // Not available, caller should fall back
   }
 
   // If still initializing, wait for it
-  if (warmBrowser.state === 'initializing') {
+  if (shared.warmBrowser.state === 'initializing') {
     return new Promise((resolve, reject) => {
-      waitQueue.push({ resolve, reject })
+      shared.waitQueue.push({ resolve, reject })
     })
   }
 
   // If busy, wait in queue
-  if (warmBrowser.state === 'busy') {
+  if (shared.warmBrowser.state === 'busy') {
     return new Promise((resolve, reject) => {
-      waitQueue.push({ resolve, reject })
+      shared.waitQueue.push({ resolve, reject })
     })
   }
 
   // Mark as busy
-  warmBrowser.state = 'busy'
-  warmBrowser.requestCount++
+  shared.warmBrowser.state = 'busy'
+  shared.warmBrowser.requestCount++
 
-  return { browser: warmBrowser.browser, page: warmBrowser.page }
+  return { browser: shared.warmBrowser.browser, page: shared.warmBrowser.page }
 }
 
 /**
@@ -347,9 +366,9 @@ export async function getWarmSession(): Promise<BrowserlessSession | null> {
  * Must be called after getWarmSession() when done.
  */
 export function releaseWarmSession(): void {
-  if (!warmBrowser) return
+  if (!shared.warmBrowser) return
 
-  warmBrowser.state = 'idle'
+  shared.warmBrowser.state = 'idle'
 
   // Check if recycling is needed
   if (needsRecycle()) {
@@ -358,11 +377,11 @@ export function releaseWarmSession(): void {
   }
 
   // Serve next waiter if any
-  if (waitQueue.length > 0) {
-    const waiter = waitQueue.shift()!
-    warmBrowser.state = 'busy'
-    warmBrowser.requestCount++
-    waiter.resolve({ browser: warmBrowser.browser, page: warmBrowser.page })
+  if (shared.waitQueue.length > 0) {
+    const waiter = shared.waitQueue.shift()!
+    shared.warmBrowser.state = 'busy'
+    shared.warmBrowser.requestCount++
+    waiter.resolve({ browser: shared.warmBrowser.browser, page: shared.warmBrowser.page })
   }
 }
 
@@ -377,7 +396,7 @@ export function isWarmBrowserEnabled(): boolean {
  * Check if warm browser is ready to serve requests
  */
 export function isWarmBrowserReady(): boolean {
-  return warmBrowser?.state === 'idle' || warmBrowser?.state === 'busy'
+  return shared.warmBrowser?.state === 'idle' || shared.warmBrowser?.state === 'busy'
 }
 
 /**
@@ -405,8 +424,6 @@ export function startPreWarm(): void {
 const KEEP_ALIVE_ENABLED = process.env.KEEP_ALIVE_ENABLED !== 'false' // Enabled by default when warm browser is on
 const KEEP_ALIVE_INTERVAL_MS = parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || '240000', 10) // 4 minutes default
 
-let keepAliveTimer: ReturnType<typeof setInterval> | null = null
-
 /**
  * Start the keep-alive ping loop.
  * Pings the app's own health endpoint to prevent Fly.io machine suspension.
@@ -416,13 +433,13 @@ export function startKeepAlive(): void {
     return
   }
 
-  if (keepAliveTimer) {
+  if (shared.keepAliveTimer) {
     return // Already running
   }
 
   console.log(`[KeepAlive] Starting self-ping every ${KEEP_ALIVE_INTERVAL_MS / 1000}s`)
 
-  keepAliveTimer = setInterval(async () => {
+  shared.keepAliveTimer = setInterval(async () => {
     try {
       const res = await fetch('http://localhost:3000/', {
         method: 'HEAD',
@@ -437,8 +454,8 @@ export function startKeepAlive(): void {
   }, KEEP_ALIVE_INTERVAL_MS)
 
   // Don't block process exit
-  if (keepAliveTimer.unref) {
-    keepAliveTimer.unref()
+  if (shared.keepAliveTimer.unref) {
+    shared.keepAliveTimer.unref()
   }
 }
 
@@ -446,9 +463,9 @@ export function startKeepAlive(): void {
  * Stop the keep-alive ping loop.
  */
 export function stopKeepAlive(): void {
-  if (keepAliveTimer) {
-    clearInterval(keepAliveTimer)
-    keepAliveTimer = null
+  if (shared.keepAliveTimer) {
+    clearInterval(shared.keepAliveTimer)
+    shared.keepAliveTimer = null
     console.log('[KeepAlive] Stopped')
   }
 }
