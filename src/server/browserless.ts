@@ -178,9 +178,10 @@ export async function createBrowserSession(options?: BrowserSessionOptions): Pro
     ]
 
     // Use persistent disk cache on Fly volume if configured
+    // Use a separate profile dir to avoid conflicts with warm browser
     if (cachedir) {
       args.push(`--disk-cache-dir=${cachedir}`)
-      args.push(`--user-data-dir=${cachedir}/profile`)
+      args.push(`--user-data-dir=${cachedir}/cold-profile`)
     }
 
     browser = await puppeteer.launch({

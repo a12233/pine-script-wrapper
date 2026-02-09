@@ -299,12 +299,12 @@ export async function ensureWarmBrowser(): Promise<void> {
     return // Not configured for warm browser
   }
 
-  if (warmBrowser && warmBrowser.state !== 'error') {
-    return // Already initialized
+  if (warmBrowser && warmBrowser.state !== 'error' && warmBrowser.state !== 'initializing') {
+    return // Already initialized and ready
   }
 
   if (initPromise) {
-    return initPromise // Already initializing
+    return initPromise // Wait for ongoing initialization
   }
 
   initPromise = initWarmBrowser()
