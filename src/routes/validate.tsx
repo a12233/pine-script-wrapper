@@ -306,14 +306,16 @@ function ValidatePage() {
       {state.status === 'done' && state.result && (
         <>
           {/* Validation Result */}
-          <div className={`card ${state.result.isValid ? 'success-card' : 'warning-card'}`}>
+          <div className={`card ${state.result.isValid ? (state.result.publishError ? 'warning-card' : 'success-card') : 'warning-card'}`}>
             <div className="card-header">
-              <h2>{state.result.isValid ? 'Script Published!' : 'Validation Failed'}</h2>
+              <h2>{state.result.isValid
+                ? (state.result.publishError ? 'Script Valid' : 'Script Published!')
+                : 'Validation Failed'}</h2>
               <span
-                className={`badge ${state.result.isValid ? 'badge-success' : 'badge-warning'}`}
+                className={`badge ${state.result.isValid ? (state.result.publishError ? 'badge-warning' : 'badge-success') : 'badge-warning'}`}
               >
                 {state.result.isValid
-                  ? 'Ready for payment'
+                  ? (state.result.publishError ? 'Publishing failed' : 'Ready for payment')
                   : `${state.result.finalErrors.length} error(s)`}
               </span>
             </div>

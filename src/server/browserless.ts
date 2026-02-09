@@ -178,10 +178,16 @@ export async function createBrowserSession(options?: BrowserSessionOptions): Pro
     ]
 
     // Use persistent disk cache on Fly volume if configured
-    // Use a separate profile dir to avoid conflicts with warm browser
+    // Each cold session gets a unique profile dir to avoid conflicts when
+    // multiple validations run concurrently (e.g., AI fix retry while
+    // previous browser is still closing).
+    let coldProfileDir: string | undefined
     if (cachedir) {
+      const sessionId = crypto.randomBytes(4).toString('hex')
+      coldProfileDir = `${cachedir}/cold-${sessionId}`
+      fs.mkdirSync(coldProfileDir, { recursive: true })
       args.push(`--disk-cache-dir=${cachedir}`)
-      args.push(`--user-data-dir=${cachedir}/cold-profile`)
+      args.push(`--user-data-dir=${coldProfileDir}`)
     }
 
     browser = await puppeteer.launch({
@@ -189,7 +195,16 @@ export async function createBrowserSession(options?: BrowserSessionOptions): Pro
       executablePath: PUPPETEER_EXECUTABLE_PATH,
       args,
       defaultViewport: { width: 1920, height: 1080 },
+      protocolTimeout: 300_000, // 5min — TradingView's JS can be slow on 2GB VM
     })
+
+    // Clean up the unique profile dir when the browser closes
+    if (coldProfileDir) {
+      const dirToClean = coldProfileDir
+      browser.on('disconnected', () => {
+        fs.rm(dirToClean, { recursive: true, force: true }, () => {})
+      })
+    }
   } else if (BROWSERLESS_API_KEY) {
     // Fallback: Connect to Browserless.io
     const wsEndpoint = buildBrowserlessEndpoint()
@@ -272,13 +287,28 @@ export async function navigateTo(
   url: string,
   options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2' }
 ): Promise<boolean> {
+  const waitUntil = options?.waitUntil || 'domcontentloaded'
   try {
     await page.goto(url, {
-      waitUntil: options?.waitUntil || 'networkidle2',
-      timeout: 60000,
+      waitUntil,
+      timeout: 90000,
     })
     return true
   } catch (error) {
+    // Retry with 'load' fallback if domcontentloaded was used
+    if (waitUntil === 'domcontentloaded') {
+      console.warn(`Navigation to ${url} failed with domcontentloaded, retrying with 'load'...`)
+      try {
+        await page.goto(url, {
+          waitUntil: 'load',
+          timeout: 90000,
+        })
+        return true
+      } catch (retryError) {
+        console.error(`Navigation to ${url} failed on retry:`, retryError)
+        return false
+      }
+    }
     console.error(`Navigation to ${url} failed:`, error)
     return false
   }

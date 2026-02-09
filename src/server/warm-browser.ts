@@ -115,7 +115,7 @@ function getChromiumArgs(): string[] {
 /**
  * Launch a new browser instance
  */
-async function launchBrowser(): Promise<Browser> {
+export async function launchBrowser(): Promise<Browser> {
   const executablePath = PUPPETEER_EXECUTABLE_PATH
   if (!executablePath) {
     throw new Error('PUPPETEER_EXECUTABLE_PATH is required for warm browser')
@@ -131,6 +131,10 @@ async function launchBrowser(): Promise<Browser> {
     executablePath,
     args: getChromiumArgs(),
     defaultViewport: { width: 1920, height: 1080 },
+    // TradingView's JS engine saturates the shared CPU VM after script insertion,
+    // causing CDP Runtime.callFunctionOn calls to queue. Default 180s timeout is
+    // too short — increase to 5 minutes to let operations complete eventually.
+    protocolTimeout: 300_000,
   })
 }
 
@@ -155,40 +159,25 @@ async function setupPage(browser: Browser): Promise<Page> {
 }
 
 /**
- * Navigate to TradingView /chart/ and open Pine Editor.
- * This pre-warms the session so validation requests start instantly.
+ * Prepare the warm session by injecting auth cookies only.
+ *
+ * IMPORTANT: We intentionally do NOT navigate to TradingView or open Pine Editor
+ * during warm-up. On the shared CPU VM (2GB), TradingView's JS engine makes the
+ * browser tab unresponsive after ~20s of idle. Since there's always a gap between
+ * warm-up completing and the first validation request arriving, pre-navigating
+ * wastes time and results in a stale/hung page.
+ *
+ * Instead, the validation loop navigates to TradingView fresh when the request
+ * arrives. The warm browser's value is:
+ * - Pre-launched Chromium (~15s saved)
+ * - Auth cookies already injected
+ * - Page ready to navigate
  */
 async function warmUpSession(page: Page, credentials: TVCredentials): Promise<void> {
-  // Inject auth cookies
+  // Inject auth cookies so the page is authenticated when we navigate later
   const cookies = parseTVCookies(credentials)
   await injectCookies(page, cookies)
-
-  // Navigate to /chart/ page
-  console.log('[WarmBrowser] Navigating to TradingView /chart/...')
-  await page.goto('https://www.tradingview.com/chart/', {
-    waitUntil: 'domcontentloaded',
-    timeout: 90000,
-  })
-
-  // Wait for chart to initialize
-  const authReady = await Promise.race([
-    page.waitForSelector('[data-name="header-user-menu-button"]', { timeout: 15000 }).then(() => 'authenticated'),
-    page.waitForSelector('[data-name="header-signin-button"]', { timeout: 15000 }).then(() => 'not-authenticated'),
-    new Promise<string>((resolve) => setTimeout(() => resolve('timeout'), 15000)),
-  ])
-
-  console.log(`[WarmBrowser] Auth status: ${authReady}`)
-
-  if (authReady === 'not-authenticated') {
-    console.warn('[WarmBrowser] Not authenticated - credentials may be expired')
-  }
-
-  // Open Pine Editor
-  console.log('[WarmBrowser] Opening Pine Editor...')
-  const pineEditorOpened = await openPineEditor(page)
-  if (!pineEditorOpened) {
-    console.warn('[WarmBrowser] Could not open Pine Editor during warm-up (will retry on first request)')
-  }
+  console.log('[WarmBrowser] Cookies injected, browser ready for navigation on first request')
 }
 
 /**
@@ -215,13 +204,13 @@ async function openPineEditor(page: Page): Promise<boolean> {
         await btn.click()
         console.log(`[WarmBrowser] Clicked: ${selector}`)
 
-        // Wait for Monaco editor
+        // Wait for Monaco editor (30s for cold start — Monaco is a large lazy-loaded bundle)
         try {
-          await page.waitForSelector('.monaco-editor', { timeout: 8000 })
+          await page.waitForSelector('.monaco-editor', { timeout: 30000 })
           console.log('[WarmBrowser] Pine Editor opened successfully')
           return true
         } catch {
-          console.log(`[WarmBrowser] Monaco didn't appear after clicking ${selector}`)
+          console.log(`[WarmBrowser] Monaco didn't appear after clicking ${selector} (30s timeout)`)
         }
       }
     } catch {
@@ -269,8 +258,16 @@ async function initWarmBrowser(): Promise<void> {
     }
   } catch (error) {
     console.error('[WarmBrowser] Initialization failed:', error)
+
+    // Close the browser to free memory for cold path fallback
     if (shared.warmBrowser) {
-      shared.warmBrowser.state = 'error'
+      try {
+        await shared.warmBrowser.browser.close()
+        console.log('[WarmBrowser] Closed failed browser to free resources')
+      } catch {
+        // Ignore close errors
+      }
+      shared.warmBrowser = null
     }
 
     // Reject all waiters
@@ -278,6 +275,9 @@ async function initWarmBrowser(): Promise<void> {
       const waiter = shared.waitQueue.shift()!
       waiter.reject(new Error(`Warm browser init failed: ${error}`))
     }
+
+    // Clear initPromise so isWarmBrowserInitializing() returns false
+    shared.initPromise = null
 
     throw error
   }
@@ -323,7 +323,14 @@ export async function ensureWarmBrowser(): Promise<void> {
   }
 
   if (shared.initPromise) {
-    return shared.initPromise // Wait for ongoing initialization
+    // Wait for ongoing init, but cap at 5 minutes to avoid blocking requests forever
+    await Promise.race([
+      shared.initPromise,
+      new Promise<void>((_, reject) =>
+        setTimeout(() => reject(new Error('Warm browser init timed out (5min)')), 300_000)
+      ),
+    ])
+    return
   }
 
   shared.initPromise = initWarmBrowser()
@@ -386,6 +393,64 @@ export function releaseWarmSession(): void {
 }
 
 /**
+ * Create a fresh page (new tab) in the warm browser's existing Chromium.
+ * Used for publishing after warm validation — the new tab has a clean JS context
+ * (no saturation from validation) while reusing the already-running Chromium
+ * process (no 52s cold start).
+ *
+ * Returns null if the warm browser is not available.
+ */
+export async function createWarmPublishSession(): Promise<BrowserlessSession | null> {
+  if (!shared.warmBrowser) return null
+
+  try {
+    const page = await shared.warmBrowser.browser.newPage()
+    await page.setViewport({ width: 1920, height: 1080 })
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    )
+    page.on('dialog', async (dialog) => {
+      console.log(`[WarmBrowser] Publish page dialog: ${dialog.type()} - "${dialog.message()}"`)
+      await dialog.accept()
+    })
+    console.log('[WarmBrowser] Created fresh publish page in warm browser')
+    return { browser: shared.warmBrowser.browser, page }
+  } catch (error) {
+    console.error('[WarmBrowser] Failed to create publish page:', error)
+    return null
+  }
+}
+
+/**
+ * Close a publish page without closing the browser.
+ * Safe to call even if the page is already closed.
+ */
+export async function closePublishPage(page: Page): Promise<void> {
+  try {
+    await page.close()
+    console.log('[WarmBrowser] Closed publish page')
+  } catch {
+    // Page may already be closed
+  }
+}
+
+/**
+ * Shut down the warm browser to free memory (e.g. before cold path fallback).
+ */
+export async function shutdownWarmBrowser(): Promise<void> {
+  if (shared.warmBrowser) {
+    try {
+      await shared.warmBrowser.browser.close()
+      console.log('[WarmBrowser] Shut down warm browser to free resources')
+    } catch {
+      // Ignore close errors
+    }
+    shared.warmBrowser = null
+    shared.initPromise = null
+  }
+}
+
+/**
  * Check if warm browser is available and configured
  */
 export function isWarmBrowserEnabled(): boolean {
@@ -397,6 +462,19 @@ export function isWarmBrowserEnabled(): boolean {
  */
 export function isWarmBrowserReady(): boolean {
   return shared.warmBrowser?.state === 'idle' || shared.warmBrowser?.state === 'busy'
+}
+
+/**
+ * Check if warm browser is still initializing (not yet ready, but may become ready).
+ * Returns false if init completed (success or failure) or was never started.
+ */
+export function isWarmBrowserInitializing(): boolean {
+  // State is explicitly 'initializing'
+  if (shared.warmBrowser?.state === 'initializing') return true
+  // Browser is null but initPromise exists — init is in progress or just started
+  // (initPromise is set before launch; warmBrowser is set once browser connects)
+  if (!shared.warmBrowser && shared.initPromise !== null) return true
+  return false
 }
 
 /**
@@ -418,15 +496,18 @@ export function startPreWarm(): void {
 
 // ============ Keep-Alive Ping ============
 // Prevents Fly.io from auto-suspending the machine after idle timeout (~5min).
-// Only active when the warm browser is enabled, since there's no point keeping
-// the machine alive without a warm browser to preserve.
+// IMPORTANT: Must ping through the EXTERNAL proxy URL, not localhost.
+// Fly.io's auto-stop only monitors external proxy connections — internal
+// localhost traffic does NOT count toward keeping the machine alive.
 
 const KEEP_ALIVE_ENABLED = process.env.KEEP_ALIVE_ENABLED !== 'false' // Enabled by default when warm browser is on
 const KEEP_ALIVE_INTERVAL_MS = parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || '240000', 10) // 4 minutes default
+const KEEP_ALIVE_URL = process.env.KEEP_ALIVE_URL || process.env.APP_URL || 'https://pine-script-wrapper.fly.dev'
 
 /**
  * Start the keep-alive ping loop.
- * Pings the app's own health endpoint to prevent Fly.io machine suspension.
+ * Pings the app's EXTERNAL URL to prevent Fly.io machine suspension.
+ * Fly.io only tracks connections through the external proxy for auto-stop decisions.
  */
 export function startKeepAlive(): void {
   if (!KEEP_ALIVE_ENABLED || !isWarmBrowserEnabled()) {
@@ -437,18 +518,17 @@ export function startKeepAlive(): void {
     return // Already running
   }
 
-  console.log(`[KeepAlive] Starting self-ping every ${KEEP_ALIVE_INTERVAL_MS / 1000}s`)
+  console.log(`[KeepAlive] Starting external ping to ${KEEP_ALIVE_URL} every ${KEEP_ALIVE_INTERVAL_MS / 1000}s`)
 
   shared.keepAliveTimer = setInterval(async () => {
     try {
-      const res = await fetch('http://localhost:3000/', {
+      const res = await fetch(KEEP_ALIVE_URL, {
         method: 'HEAD',
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(10000),
       })
       console.log(`[KeepAlive] Ping: ${res.status}`)
     } catch (error) {
-      // Don't log full error to avoid noise — a failed ping just means the
-      // machine might suspend, which is recoverable
+      // A failed ping means the machine might suspend, which is recoverable
       console.log('[KeepAlive] Ping failed (non-fatal)')
     }
   }, KEEP_ALIVE_INTERVAL_MS)
