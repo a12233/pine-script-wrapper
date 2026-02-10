@@ -175,6 +175,13 @@ export async function createBrowserSession(options?: BrowserSessionOptions): Pro
       '--disable-canvas-aa',
       '--disable-2d-canvas-clip-aa',
       '--disable-gl-drawing-for-tests',
+      '--disable-ipc-flooding-protection',
+      '--disable-renderer-backgrounding',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-hang-monitor',
+      '--disable-field-trial-config',
+      '--disable-breakpad',
+      '--disable-domain-reliability',
     ]
 
     // Use persistent disk cache on Fly volume if configured

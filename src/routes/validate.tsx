@@ -143,8 +143,8 @@ function ValidatePage() {
   }
 
   const handleProceedToPayment = async () => {
-    if (!state.result?.indicatorUrl) {
-      alert('Script must be validated and published first')
+    if (!state.result?.isValid) {
+      alert('Script must be validated first')
       return
     }
 
@@ -357,8 +357,8 @@ function ValidatePage() {
             )}
           </div>
 
-          {/* Payment button - only show if valid and published */}
-          {state.result.isValid && state.result.indicatorUrl && (
+          {/* Payment button - show if valid (indicatorUrl may not be captured immediately) */}
+          {state.result.isValid && !state.result.publishError && (
             <div className="card">
               <div className="card-header">
                 <h2>Complete Your Purchase</h2>

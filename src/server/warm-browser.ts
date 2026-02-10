@@ -25,6 +25,7 @@ import { getServiceAccountCredentials } from './service-validation'
 
 const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH
 const USE_WARM_BROWSER = process.env.USE_WARM_BROWSER === 'true'
+const WARM_PRE_NAVIGATE = process.env.WARM_PRE_NAVIGATE !== 'false' // Enabled by default
 
 // Persistent cache directory on Fly volume (if available)
 const CHROME_CACHE_DIR = process.env.CHROME_CACHE_DIR || '/data/chrome-cache'
@@ -94,6 +95,13 @@ function getChromiumArgs(): string[] {
     '--metrics-recording-only',
     '--mute-audio',
     '--disable-features=Translate,MediaRouter,OptimizationHints,AutofillServerCommunication',
+    '--disable-ipc-flooding-protection',       // Don't throttle rapid CDP messages
+    '--disable-renderer-backgrounding',        // Don't throttle background tabs
+    '--disable-backgrounding-occluded-windows',
+    '--disable-hang-monitor',                  // Prevent "Page Unresponsive" popup
+    '--disable-field-trial-config',            // Disable Chrome A/B experiments
+    '--disable-breakpad',                      // Disable crash reporting
+    '--disable-domain-reliability',            // Disable monitoring
     '--window-size=1920,1080',
   ]
 
@@ -139,6 +147,42 @@ export async function launchBrowser(): Promise<Browser> {
 }
 
 /**
+ * URL patterns to block via CDP Network.setBlockedURLs.
+ * Only block ads/analytics — TradingView's UI components depend on SVG icons,
+ * fonts, and images for proper rendering (dialog buttons won't appear without them).
+ * JS, CSS, HTML, and XHR/fetch are NOT blocked (needed for functionality + DOM).
+ */
+const BLOCKED_URL_PATTERNS = [
+  // Ads & analytics only — safe to block, no UI impact
+  '*doubleclick.net*',
+  '*google-analytics.com*',
+  '*googletagmanager.com*',
+  '*googlesyndication.com*',
+  '*googleadservices.com*',
+  '*facebook.net*',
+  '*facebook.com/tr*',
+  // Media (video only — not needed for automation)
+  '*.mp4',
+  '*.webm',
+]
+
+/**
+ * Block unnecessary resources on a page via CDP Network.setBlockedURLs.
+ * Lighter than setRequestInterception — no pause/resume overhead per request.
+ */
+export async function blockUnnecessaryResources(page: Page): Promise<void> {
+  try {
+    const client = await page.createCDPSession()
+    await client.send('Network.enable')
+    await client.send('Network.setBlockedURLs', { urls: BLOCKED_URL_PATTERNS })
+    await client.detach()
+    console.log('[WarmBrowser] Resource blocking enabled')
+  } catch (err) {
+    console.log(`[WarmBrowser] Resource blocking failed (non-fatal): ${err instanceof Error ? err.message : 'unknown'}`)
+  }
+}
+
+/**
  * Set up a fresh page with proper viewport, user agent, and dialog handling
  */
 async function setupPage(browser: Browser): Promise<Page> {
@@ -155,29 +199,53 @@ async function setupPage(browser: Browser): Promise<Page> {
     await dialog.accept()
   })
 
+  // Block ads, analytics, images, fonts, media to speed up page loads
+  await blockUnnecessaryResources(page)
+
   return page
 }
 
 /**
- * Prepare the warm session by injecting auth cookies only.
+ * Prepare the warm session: inject auth cookies and optionally pre-navigate.
  *
- * IMPORTANT: We intentionally do NOT navigate to TradingView or open Pine Editor
- * during warm-up. On the shared CPU VM (2GB), TradingView's JS engine makes the
- * browser tab unresponsive after ~20s of idle. Since there's always a gap between
- * warm-up completing and the first validation request arriving, pre-navigating
- * wastes time and results in a stale/hung page.
+ * When WARM_PRE_NAVIGATE=true (default on 2 vCPU / 4GB VM):
+ * - Navigates to /chart/ and opens Pine Editor during warmup
+ * - First request skips ~25s of navigation (if page is still responsive)
+ * - If pre-navigate fails, logs warning and falls back to cookie-only mode
  *
- * Instead, the validation loop navigates to TradingView fresh when the request
- * arrives. The warm browser's value is:
- * - Pre-launched Chromium (~15s saved)
- * - Auth cookies already injected
- * - Page ready to navigate
+ * When WARM_PRE_NAVIGATE=false (legacy behavior for 1 vCPU / 2GB):
+ * - Only injects cookies; validation loop navigates fresh on first request
  */
 async function warmUpSession(page: Page, credentials: TVCredentials): Promise<void> {
   // Inject auth cookies so the page is authenticated when we navigate later
   const cookies = parseTVCookies(credentials)
   await injectCookies(page, cookies)
-  console.log('[WarmBrowser] Cookies injected, browser ready for navigation on first request')
+  console.log('[WarmBrowser] Cookies injected')
+
+  if (!WARM_PRE_NAVIGATE) {
+    console.log('[WarmBrowser] Pre-navigate disabled, browser ready for navigation on first request')
+    return
+  }
+
+  // Pre-navigate to /chart/ and open Pine Editor
+  try {
+    console.log('[WarmBrowser] Pre-navigating to /chart/...')
+    await page.goto('https://www.tradingview.com/chart/', {
+      waitUntil: 'domcontentloaded',
+      timeout: 90000,
+    })
+    console.log('[WarmBrowser] Chart page loaded, opening Pine Editor...')
+
+    const editorOpened = await openPineEditor(page)
+    if (editorOpened) {
+      console.log('[WarmBrowser] Pre-navigate complete: Pine Editor ready')
+    } else {
+      console.log('[WarmBrowser] Pre-navigate: Pine Editor did not open (will retry on first request)')
+    }
+  } catch (err) {
+    console.log(`[WarmBrowser] Pre-navigate failed (non-fatal): ${err instanceof Error ? err.message : 'unknown'}`)
+    console.log('[WarmBrowser] Will navigate fresh on first request')
+  }
 }
 
 /**
@@ -219,6 +287,52 @@ async function openPineEditor(page: Page): Promise<boolean> {
   }
 
   return false
+}
+
+/**
+ * Check if the pre-navigated page is still responsive.
+ * Uses a quick CDP DOM.getDocument call with a 2s timeout.
+ * Returns true if page is on /chart/ with Pine Editor open and responsive.
+ */
+export async function isPagePreNavigated(page: Page): Promise<boolean> {
+  try {
+    // Check URL first (fast, no CDP needed)
+    const url = page.url()
+    if (!url.includes('/chart/')) {
+      console.log(`[WarmBrowser] Health check: not on /chart/ (url=${url})`)
+      return false
+    }
+
+    // Quick CDP health check with 2s timeout
+    const client = await page.createCDPSession()
+    try {
+      const docPromise = client.send('DOM.getDocument', { depth: 0 })
+      const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000))
+      const result = await Promise.race([docPromise, timeoutPromise])
+      if (!result) {
+        console.log('[WarmBrowser] Health check: STALE (CDP timeout)')
+        return false
+      }
+
+      // Check for Monaco editor via CDP
+      const { nodeId } = await client.send('DOM.querySelector', {
+        nodeId: (result as any).root.nodeId,
+        selector: '.monaco-editor',
+      })
+      if (!nodeId) {
+        console.log('[WarmBrowser] Health check: no Monaco editor')
+        return false
+      }
+
+      console.log('[WarmBrowser] Health check: READY (page responsive, Pine Editor open)')
+      return true
+    } finally {
+      await client.detach().catch(() => {})
+    }
+  } catch (err) {
+    console.log(`[WarmBrowser] Health check: STALE (${err instanceof Error ? err.message : 'unknown'})`)
+    return false
+  }
 }
 
 /**

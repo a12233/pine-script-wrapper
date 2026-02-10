@@ -31,6 +31,8 @@ import {
   isWarmBrowserReady,
   isWarmBrowserInitializing,
   shutdownWarmBrowser,
+  blockUnnecessaryResources,
+  isPagePreNavigated,
 } from './warm-browser'
 import type { Page } from 'puppeteer-core'
 
@@ -506,10 +508,24 @@ async function cdpOpenAndFillPublishDialog(
     console.log(`[Publish] Publish button clicked: ${log[0]}`)
 
     // Step 2: Wait for publish dialog content to appear
-    // TradingView uses proprietary overlay wrappers (overlayScrollWrap-*) without
-    // standard dialog attributes. Instead of finding a container, we directly
-    // search the page for form fields that appear after clicking publish.
-    await delay(3000)
+    // Poll for title input — it appears quickly (~50-100ms).
+    {
+      const pollStart = Date.now()
+      const DIALOG_POLL_MAX_MS = 6000
+      let dialogReady = false
+      while (Date.now() - pollStart < DIALOG_POLL_MAX_MS) {
+        const titleNode = await cdpFind(client, 'input[type="text"]')
+        if (titleNode) {
+          dialogReady = true
+          console.log(`[Publish] Title input appeared after ${Date.now() - pollStart}ms`)
+          break
+        }
+        await delay(500)
+      }
+      if (!dialogReady) {
+        console.log(`[Publish] Dialog not found after ${DIALOG_POLL_MAX_MS}ms, continuing anyway`)
+      }
+    }
 
     // Step 3: Fill title — search the ENTIRE page for title input
     // The publish dialog's title input should be the only visible text input
@@ -555,7 +571,29 @@ async function cdpOpenAndFillPublishDialog(
     }
     if (!descFilled) log.push('desc:NOT_FOUND')
 
-    await delay(500)
+    // Step 4b: Poll for overlay buttons to appear (checkboxes, Continue)
+    // TradingView may only render these after the title/description fields are filled.
+    {
+      const overlayPollStart = Date.now()
+      const OVERLAY_POLL_MAX_MS = 5000
+      let overlayReady = false
+      while (Date.now() - overlayPollStart < OVERLAY_POLL_MAX_MS) {
+        const overlays = await cdpFindAll(client, '[class*="overlayScrollWrap"]')
+        if (overlays.length > 0) {
+          const lastOverlay = overlays[overlays.length - 1]
+          const btns = await cdpFindAll(client, 'button', lastOverlay)
+          if (btns.length > 0) {
+            console.log(`[Publish] Overlay buttons ready after ${Date.now() - overlayPollStart}ms (${btns.length} buttons)`)
+            overlayReady = true
+            break
+          }
+        }
+        await delay(500)
+      }
+      if (!overlayReady) {
+        console.log(`[Publish] Overlay buttons not found after ${OVERLAY_POLL_MAX_MS}ms, continuing anyway`)
+      }
+    }
 
     // Step 5-7: Check checkboxes, Continue, and visibility
     // IMPORTANT: Search ONLY within overlay containers to avoid iterating
@@ -567,7 +605,35 @@ async function cdpOpenAndFillPublishDialog(
 
     if (overlayId) {
       // Check checkboxes within overlay only
-      const checkboxes = await cdpFindAll(client, 'input[type="checkbox"]', overlayId)
+      let checkboxes = await cdpFindAll(client, 'input[type="checkbox"]', overlayId)
+
+      // Look for Continue button within overlay only
+      let overlayBtns = await cdpFindAll(client, 'button', overlayId)
+      console.log(`[Publish] Overlay has ${overlayBtns.length} buttons, ${checkboxes.length} checkboxes`)
+
+      // Fallback: if overlay has 0 buttons, search the publish dialog or entire page
+      if (overlayBtns.length === 0) {
+        // Try the publish dialog container
+        const dialogNode = await cdpFind(client, '[data-dialog-name="publish-script"]')
+        if (dialogNode) {
+          overlayBtns = await cdpFindAll(client, 'button', dialogNode)
+          checkboxes = await cdpFindAll(client, 'input[type="checkbox"]', dialogNode)
+          console.log(`[Publish] Dialog fallback: ${overlayBtns.length} buttons, ${checkboxes.length} checkboxes`)
+        }
+        // Last resort: search globally for checkboxes + Continue
+        if (overlayBtns.length === 0) {
+          // Log overlay HTML for debugging
+          try {
+            const { outerHTML } = await client.send('DOM.getOuterHTML', { nodeId: overlayId })
+            console.log(`[Publish] Overlay HTML (first 500): ${outerHTML.substring(0, 500)}`)
+          } catch {}
+          checkboxes = await cdpFindAll(client, 'input[type="checkbox"]')
+          overlayBtns = await cdpFindAll(client, 'button')
+          console.log(`[Publish] Global fallback: ${overlayBtns.length} buttons, ${checkboxes.length} checkboxes`)
+          await page.screenshot({ path: `/data/screenshots/publish-0-buttons-debug.png` }).catch(() => {})
+        }
+      }
+
       let checkedCount = 0
       for (const cbId of checkboxes) {
         try {
@@ -580,16 +646,13 @@ async function cdpOpenAndFillPublishDialog(
       }
       if (checkedCount > 0) log.push(`checkboxes:${checkedCount}`)
 
-      // Look for Continue button within overlay only
-      const overlayBtns = await cdpFindAll(client, 'button', overlayId)
-      console.log(`[Publish] Overlay has ${overlayBtns.length} buttons`)
       for (const btnId of overlayBtns) {
         const text = await cdpGetText(client, btnId)
         if (text.toLowerCase().includes('continue') && !text.toLowerCase().includes('discontinue')) {
           await cdpClickNode(client, btnId)
           log.push('continue:clicked')
           console.log('[Publish] Clicked Continue button')
-          await delay(2000)
+          await delay(1000)
           break
         }
       }
@@ -774,7 +837,7 @@ async function cdpClickFinalPublishInner(page: Page): Promise<{ success: boolean
     }
 
     // Wait for result
-    await delay(5000)
+    await delay(3000)
 
     // Check for new tab
     const newPage = await Promise.race([
@@ -784,7 +847,7 @@ async function cdpClickFinalPublishInner(page: Page): Promise<{ success: boolean
 
     if (newPage) {
       try {
-        await delay(3000)
+        await delay(1500)
         const newTabUrl = newPage.url()
         console.log(`[Publish] New tab URL: ${newTabUrl}`)
         await newPage.close().catch(() => {})
@@ -917,6 +980,62 @@ async function _extractConsoleErrorsCDP(page: Page): Promise<{
 }
 
 /**
+ * Get the current console panel HTML via CDP DOM operations.
+ * Returns empty string if console panel not found.
+ */
+async function cdpGetConsolePanelHTML(page: Page): Promise<string> {
+  const client = await page.createCDPSession()
+  try {
+    const { root } = await client.send('DOM.getDocument', { depth: 0 })
+    for (const sel of ['[data-name="console-panel"]', '.console-panel']) {
+      try {
+        const { nodeId } = await client.send('DOM.querySelector', { nodeId: root.nodeId, selector: sel })
+        if (nodeId) {
+          const { outerHTML } = await client.send('DOM.getOuterHTML', { nodeId })
+          return outerHTML
+        }
+      } catch {}
+    }
+    return ''
+  } finally {
+    await client.detach().catch(() => {})
+  }
+}
+
+/**
+ * Poll the console panel for changes after Add to Chart (Ctrl+Enter).
+ * Errors typically appear in 3-5s. Polls every 1s, max 15s.
+ * Falls back to a fixed delay if console panel is not found.
+ */
+async function pollConsolePanelForChanges(page: Page, initialHTML: string): Promise<void> {
+  const MAX_POLL_MS = 15000
+  const POLL_INTERVAL_MS = 1000
+  const start = Date.now()
+
+  while (Date.now() - start < MAX_POLL_MS) {
+    await delay(POLL_INTERVAL_MS)
+    try {
+      const currentHTML = await cdpGetConsolePanelHTML(page)
+      if (!currentHTML) {
+        // Console panel not found — fall back to remaining wait
+        console.log('[Warm Validate] Console panel not found during poll, using fixed wait')
+        await delay(Math.max(0, 5000 - (Date.now() - start)))
+        return
+      }
+      if (currentHTML !== initialHTML) {
+        console.log(`[Warm Validate] Console panel changed after ${Date.now() - start}ms`)
+        return
+      }
+    } catch {
+      // CDP error — wait a bit more and stop polling
+      await delay(2000)
+      return
+    }
+  }
+  console.log(`[Warm Validate] Console panel poll timed out after ${MAX_POLL_MS}ms`)
+}
+
+/**
  * Run validation+publish using the warm browser session.
  * Returns null if warm browser isn't available (caller should fall back to cold path).
  */
@@ -936,28 +1055,36 @@ async function runWarmValidationLoop(
   try {
     console.log('[ValidationLoop] Using warm browser path')
 
-    // The warm browser has Chromium pre-launched with auth cookies injected,
-    // but NO TradingView page loaded (to avoid the stale/hung page problem).
-    // Navigate to /chart/ fresh — this takes ~15-30s but the browser is already
-    // running so we skip the ~15s Chromium launch time.
-    console.log('[ValidationLoop] Navigating warm browser to /chart/...')
-    await page.goto('https://www.tradingview.com/chart/', {
-      waitUntil: 'domcontentloaded',
-      timeout: 90000,
-    })
-    console.log('[ValidationLoop] Page loaded, waiting for sidebar...')
+    // Check if page was pre-navigated during warmup (Phase 4 optimization).
+    // If the page is already on /chart/ with Pine Editor open and responsive,
+    // skip the ~25s navigation entirely.
+    const preNavigated = await isPagePreNavigated(page)
 
-    // Wait for sidebar button to render then open Pine Editor
-    const pineBtn = await page.waitForSelector(
-      '[data-name="pine-dialog-button"], [data-name="open-pine-editor"]',
-      { timeout: 60000 }
-    ).catch(() => null)
-    if (!pineBtn) {
-      console.log('[ValidationLoop] Sidebar buttons did not render in 60s')
-      return null // Fall back to cold path
+    if (preNavigated) {
+      console.log('[ValidationLoop] Page pre-navigated, skipping navigation (~25s saved)')
+    } else {
+      // Navigate fresh — either pre-navigate was disabled or page went stale
+      await blockUnnecessaryResources(page)
+
+      console.log('[ValidationLoop] Navigating warm browser to /chart/...')
+      await page.goto('https://www.tradingview.com/chart/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 90000,
+      })
+      console.log('[ValidationLoop] Page loaded, waiting for sidebar...')
+
+      // Wait for sidebar button to render then open Pine Editor
+      const pineBtn = await page.waitForSelector(
+        '[data-name="pine-dialog-button"], [data-name="open-pine-editor"]',
+        { timeout: 60000 }
+      ).catch(() => null)
+      if (!pineBtn) {
+        console.log('[ValidationLoop] Sidebar buttons did not render in 60s')
+        return null // Fall back to cold path
+      }
+      await pineBtn.click()
+      console.log('[ValidationLoop] Clicked Pine Editor button')
     }
-    await pineBtn.click()
-    console.log('[ValidationLoop] Clicked Pine Editor button')
 
     const editorExists = await page.waitForSelector('.monaco-editor', { timeout: 60000 }).catch(() => null)
     if (!editorExists) {
@@ -968,38 +1095,13 @@ async function runWarmValidationLoop(
 
     timer.mark('pine editor ready')
 
-    // === DIALOG-FIRST APPROACH ===
-    // Fill publish dialog BEFORE script insertion (CDP operations are ~1-2s each).
-    // After insertion, CDP operations slow to ~30-60s each due to CPU saturation.
-    // The dialog stays open during script insertion — tested: the submit button
-    // (last in DOM order, nodeId ~1381) retains its box model and is clickable.
-    // Three hidden toolbar "Publish" buttons also exist in DOM but always fail
-    // getBoxModel — reverse iteration skips them immediately.
+    // === INSERT-FIRST APPROACH ===
+    // Insert script and validate BEFORE opening publish dialog.
+    // On 2 vCPU / 4GB VM, CDP ops are fast (<1s) even after script insertion.
+    // This avoids the "Script is not on the chart" blocker that appears when
+    // the publish dialog is opened before the script is added to the chart.
     let indicatorUrl: string | undefined
     let publishError: string | undefined
-
-    if (publishOptions) {
-      timer.mark('starting publish dialog')
-      try {
-        console.log('[Warm Validate] Opening publish dialog via CDP (pre-insertion)...')
-        const dialogResult = await cdpOpenAndFillPublishDialog(page, {
-          title: publishOptions.title,
-          description: publishOptions.description,
-          visibility: publishOptions.visibility,
-        })
-
-        if (!dialogResult.success) {
-          publishError = dialogResult.error
-          console.log(`[Warm Validate] Publish dialog failed: ${publishError}`)
-        } else {
-          console.log('[Warm Validate] Publish dialog filled, proceeding to script insertion')
-        }
-        timer.mark('publish dialog filled')
-      } catch (error) {
-        publishError = error instanceof Error ? error.message : 'Unknown publish dialog error'
-        console.error('[Warm Validate] Publish dialog error:', error)
-      }
-    }
 
     // === INSERT SCRIPT ===
     console.log('[Warm Validate] Inserting script via CDP...')
@@ -1010,45 +1112,23 @@ async function runWarmValidationLoop(
     await delay(100)
     await cdpInsertText(page, script)
     console.log('[Warm Validate] Script inserted')
-
-    console.log('[Warm Validate] Waiting for Monaco to compile...')
-    await delay(15000)
-    console.log('[Warm Validate] Compile wait done')
-
-    // === CLICK FINAL PUBLISH (after insertion + compile) ===
-    // The dialog submit button is still in the DOM with valid box model.
-    // Reverse XPath iteration finds it on the first try (~8s).
-    if (publishOptions && !publishError) {
-      timer.mark('starting publish submit')
-      console.log('[Warm Validate] Clicking final Publish button via CDP...')
-      try {
-        const submitResult = await cdpClickFinalPublish(page)
-        if (submitResult.success) {
-          indicatorUrl = submitResult.indicatorUrl
-          console.log(`[Warm Validate] Published: ${indicatorUrl || '(no URL captured)'}`)
-        } else {
-          publishError = submitResult.error
-          console.log(`[Warm Validate] Final publish failed: ${publishError}`)
-        }
-      } catch (error) {
-        publishError = error instanceof Error ? error.message : 'Publish submit error'
-        console.error('[Warm Validate] Publish submit error:', error)
-      }
-      timer.mark('publish complete')
-    }
+    timer.mark('script inserted')
 
     // === VALIDATE (add to chart + extract errors) ===
-    // Click "Add to chart" using keyboard shortcut — after this, JS saturates
-    // and only CDP Input.* operations work.
+    // Capture initial console panel HTML BEFORE Ctrl+Enter for change detection
+    const initialConsoleHTML = await cdpGetConsolePanelHTML(page)
+
+    // Click "Add to chart" using keyboard shortcut
     console.log('[Warm Validate] Adding script to chart via keyboard...')
     await page.keyboard.down('Control')
     await page.keyboard.press('Enter')
     await page.keyboard.up('Control')
     console.log('[Warm Validate] Sent Ctrl+Enter (Add to chart)')
 
-    // Wait for compilation/add-to-chart result
-    await delay(10000)
-    console.log('[Warm Validate] Waiting for compilation result...')
+    // Poll console panel for changes instead of fixed 10s wait.
+    // Errors typically appear in 3-5s after Ctrl+Enter.
+    console.log('[Warm Validate] Polling console panel for compilation result...')
+    await pollConsolePanelForChanges(page, initialConsoleHTML)
 
     // Extract errors from console using CDP DOM operations (no page.evaluate)
     const { errors, rawOutput } = await extractConsoleErrors(page)
@@ -1056,8 +1136,47 @@ async function runWarmValidationLoop(
     const errorCount = errors.filter(e => e.type === 'error').length
     const isValid = errorCount === 0
     console.log(`[Warm Validate] Validation: ${errorCount} errors, isValid=${isValid}`)
-
     timer.mark('validation complete')
+
+    // === PUBLISH (only if valid and requested) ===
+    // Now that the script is on the chart, the publish dialog shows the full form
+    // (with checkboxes + Continue) instead of the "Script is not on the chart" blocker.
+    if (publishOptions && isValid) {
+      timer.mark('starting publish dialog')
+      try {
+        console.log('[Warm Validate] Opening publish dialog via CDP (post-validation)...')
+        const dialogResult = await cdpOpenAndFillPublishDialog(page, {
+          title: publishOptions.title,
+          description: publishOptions.description,
+          visibility: publishOptions.visibility,
+        })
+
+        if (!dialogResult.success) {
+          publishError = dialogResult.error
+          console.log(`[Warm Validate] Publish dialog failed: ${publishError}`)
+        } else {
+          console.log('[Warm Validate] Publish dialog filled')
+          timer.mark('publish dialog filled')
+
+          // Click final Publish submit button
+          console.log('[Warm Validate] Clicking final Publish button via CDP...')
+          const submitResult = await cdpClickFinalPublish(page)
+          if (submitResult.success) {
+            indicatorUrl = submitResult.indicatorUrl
+            console.log(`[Warm Validate] Published: ${indicatorUrl || '(no URL captured)'}`)
+          } else {
+            publishError = submitResult.error
+            console.log(`[Warm Validate] Final publish failed: ${publishError}`)
+          }
+        }
+      } catch (error) {
+        publishError = error instanceof Error ? error.message : 'Publish error'
+        console.error('[Warm Validate] Publish error:', error)
+      }
+      timer.mark('publish complete')
+    } else if (publishOptions && !isValid) {
+      console.log('[Warm Validate] Script has errors, skipping publish')
+    }
 
     let currentScript = script
     let iterations = 1
@@ -1089,13 +1208,18 @@ async function runWarmValidationLoop(
           await page.keyboard.up('Control')
           await delay(100)
           await cdpInsertText(page, currentScript)
-          await delay(15000) // Wait for Monaco compile
+          await delay(8000) // Wait for Monaco compile (reduced from 15s)
+
+          // Capture console HTML before Ctrl+Enter for polling
+          const retryConsoleHTML = await cdpGetConsolePanelHTML(page)
 
           // Add to chart via keyboard
           await page.keyboard.down('Control')
           await page.keyboard.press('Enter')
           await page.keyboard.up('Control')
-          await delay(10000)
+
+          // Poll for console changes instead of fixed 10s wait
+          await pollConsolePanelForChanges(page, retryConsoleHTML)
 
           const { errors: fixedErrors } = await extractConsoleErrors(page)
 
